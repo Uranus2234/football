@@ -32,6 +32,8 @@ def randomize_joint_default_pos(
     # resolve environment ids
     if env_ids is None:
         env_ids = torch.arange(env.scene.num_envs, device=asset.device)
+    else:
+        env_ids = env_ids.to(device=asset.device)
 
     # resolve joint indices
     if asset_cfg.joint_ids == slice(None):
@@ -45,11 +47,27 @@ def randomize_joint_default_pos(
             pos, pos_distribution_params, env_ids, joint_ids, operation=operation, distribution=distribution
         )[env_ids][:, joint_ids]
 
-        if env_ids != slice(None) and joint_ids != slice(None):
-            env_ids = env_ids[:, None]
-        asset.data.default_joint_pos[env_ids, joint_ids] = pos
+        asset_env_ids = env_ids[:, None] if not isinstance(joint_ids, slice) else env_ids
+        asset.data.default_joint_pos[asset_env_ids, joint_ids] = pos
         # update the offset in action since it is not updated automatically
-        env.action_manager.get_term("joint_pos")._offset[env_ids, joint_ids] = pos
+        action_term = env.action_manager.get_term("joint_pos")
+        offset = getattr(action_term, "_offset", None)
+        if isinstance(offset, torch.Tensor):
+            action_joint_ids = getattr(action_term, "_joint_ids", slice(None))
+            if isinstance(action_joint_ids, slice):
+                action_cols = joint_ids
+            elif isinstance(joint_ids, slice):
+                action_cols = slice(None)
+                pos = asset.data.default_joint_pos[env_ids][:, action_joint_ids]
+            else:
+                joint_id_to_action_col = {int(joint_id): col for col, joint_id in enumerate(action_joint_ids)}
+                action_cols = torch.tensor(
+                    [joint_id_to_action_col[int(joint_id)] for joint_id in joint_ids.tolist()],
+                    dtype=torch.long,
+                    device=asset.device,
+                )
+            offset_env_ids = env_ids[:, None] if not isinstance(action_cols, slice) else env_ids
+            offset[offset_env_ids, action_cols] = pos
 
 
 def randomize_rigid_body_com(

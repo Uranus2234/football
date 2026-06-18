@@ -9,6 +9,12 @@
 
 import argparse
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WHOLE_BODY_TRACKING_SRC = REPO_ROOT / "source" / "whole_body_tracking"
+if str(WHOLE_BODY_TRACKING_SRC) not in sys.path:
+    sys.path.insert(0, str(WHOLE_BODY_TRACKING_SRC))
 
 from isaaclab.app import AppLauncher
 
@@ -24,6 +30,9 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument(
+    "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
+)
 parser.add_argument("--registry_name", type=str, required=False, help="The name of the wand registry.")
 parser.add_argument("--motion_file", type=str, required=True, help="The path to the motion file.")
 
@@ -46,10 +55,27 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+# Isaac Lab's URDF converter imports the URDF importer Python module lazily
+# when the robot is spawned.  Some Isaac Sim 4.5 installations do not enable
+# this extension in the default headless experience, so enable it explicitly.
+try:
+    import omni.kit.app
+
+    ext_manager = omni.kit.app.get_app().get_extension_manager()
+    if not ext_manager.is_extension_enabled("isaacsim.asset.importer.urdf"):
+        ext_manager.set_extension_enabled_immediate("isaacsim.asset.importer.urdf", True)
+    from isaacsim.asset.importer.urdf import _urdf
+
+    if not hasattr(_urdf.ImportConfig, "set_merge_fixed_ignore_inertia"):
+        _urdf.ImportConfig.set_merge_fixed_ignore_inertia = _urdf.ImportConfig.set_merge_fixed_joints
+except Exception as exc:
+    print(f"[WARN] Failed to enable isaacsim.asset.importer.urdf extension: {exc}")
+
 """Rest everything follows."""
 
 import gymnasium as gym
 import os
+import pickle
 import torch
 from datetime import datetime
 
@@ -61,7 +87,7 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_pickle, dump_yaml
+from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -74,6 +100,69 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+class LegacyRslRlObservationAdapter:
+    """Adapt new IsaacLab TensorDict observations to this repo's RSL-RL runner.
+
+    Newer ``RslRlVecEnvWrapper`` versions return a TensorDict directly, while
+    the bundled TienKung RSL-RL runner expects ``(policy_obs, extras)``.
+    """
+
+    def __init__(self, env):
+        self.env = env
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    @staticmethod
+    def _split_observations(obs):
+        if isinstance(obs, tuple) and len(obs) == 2:
+            return obs
+        if torch.is_tensor(obs):
+            return obs, {}
+        return obs["policy"], {"observations": obs}
+
+    @staticmethod
+    def _split_step(result):
+        obs, rewards, dones, infos = result
+        if isinstance(obs, tuple) and len(obs) == 2:
+            policy_obs, obs_extras = obs
+            if "observations" not in infos and isinstance(obs_extras, dict) and "observations" in obs_extras:
+                infos["observations"] = obs_extras["observations"]
+            return policy_obs, rewards, dones, infos
+        if torch.is_tensor(obs):
+            return obs, rewards, dones, infos
+        infos["observations"] = obs
+        return obs["policy"], rewards, dones, infos
+
+    def get_observations(self):
+        return self._split_observations(self.env.get_observations())
+
+    def reset(self):
+        result = self.env.reset()
+        if isinstance(result, tuple) and len(result) == 2:
+            obs, extras = result
+            if not (isinstance(obs, tuple) and len(obs) == 2) and not torch.is_tensor(obs):
+                return obs["policy"], {"observations": obs, **extras}
+        return result
+
+    def step(self, actions):
+        return self._split_step(self.env.step(actions))
+
+    def close(self):
+        return self.env.close()
+
+
+def dump_pickle(filename: str, data):
+    """Dump data to a pickle file.
+
+    Newer Isaac Lab versions removed ``isaaclab.utils.io.dump_pickle`` while
+    keeping ``dump_yaml``.  Keep a local helper for compatibility.
+    """
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with open(filename, "wb") as file:
+        pickle.dump(data, file)
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -90,6 +179,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    # multi-gpu training configuration
+    if args_cli.distributed:
+        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
+        agent_cfg.device = f"cuda:{app_launcher.local_rank}"
+
+        # set seed to have diversity in different processes
+        seed = agent_cfg.seed + app_launcher.local_rank
+        env_cfg.seed = seed
+        agent_cfg.seed = seed
 
     # load the motion file from the wandb registry
     # registry_name = args_cli.registry_name
@@ -103,8 +201,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # artifact = api.artifact(registry_name)
     # env_cfg.commands.motion.motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
     
-    motion_file = args_cli.motion_file
-    env_cfg.commands.motion.motion_file = motion_file
+    motion_file = str(Path(args_cli.motion_file).resolve())
+    if hasattr(env_cfg.commands.motion, "motion_files"):
+        env_cfg.commands.motion.motion_files = [motion_file]
+    if hasattr(env_cfg.commands.motion, "motion_file"):
+        env_cfg.commands.motion.motion_file = motion_file
     
 
     # specify directory for logging experiments
@@ -137,6 +238,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
+    env = LegacyRslRlObservationAdapter(env)
 
     # create runner from rsl-rl
     runner = OnPolicyRunner(

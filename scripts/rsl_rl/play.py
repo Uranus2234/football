@@ -3,7 +3,14 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import math
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WHOLE_BODY_TRACKING_SRC = REPO_ROOT / "source" / "whole_body_tracking"
+if str(WHOLE_BODY_TRACKING_SRC) not in sys.path:
+    sys.path.insert(0, str(WHOLE_BODY_TRACKING_SRC))
 
 from isaaclab.app import AppLauncher
 
@@ -20,6 +27,26 @@ parser.add_argument(
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
+parser.add_argument(
+    "--play_robot_pose_range",
+    type=float,
+    nargs=3,
+    metavar=("X_M", "Y_M", "YAW_DEG"),
+    default=None,
+    help="Play-only symmetric root randomization override: x/y in meters and yaw in degrees.",
+)
+parser.add_argument(
+    "--play_face_goal",
+    action="store_true",
+    default=False,
+    help="Play-only reset override that rotates the initial robot+ball layout so the robot faces the goal.",
+)
+parser.add_argument(
+    "--play_face_goal_yaw_offset_deg",
+    type=float,
+    default=0.0,
+    help="Extra yaw offset in degrees applied after --play_face_goal alignment.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -53,7 +80,7 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -62,11 +89,110 @@ import soccer.tasks  # noqa: F401
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
 
+class RslRlVecEnvWrapper:
+    """Compatibility wrapper for the TienKung/RSL-RL runner."""
+
+    def __init__(self, env):
+        self.env = env
+        self.num_envs = self.unwrapped.num_envs
+        self.device = self.unwrapped.device
+        self.max_episode_length = self.unwrapped.max_episode_length
+        if hasattr(self.unwrapped, "action_manager"):
+            self.num_actions = self.unwrapped.action_manager.total_action_dim
+        else:
+            self.num_actions = gym.spaces.flatdim(self.unwrapped.single_action_space)
+        self.env.reset()
+
+    @property
+    def cfg(self):
+        return self.unwrapped.cfg
+
+    @property
+    def unwrapped(self):
+        return self.env.unwrapped
+
+    @property
+    def episode_length_buf(self):
+        return self.unwrapped.episode_length_buf
+
+    @episode_length_buf.setter
+    def episode_length_buf(self, value):
+        self.unwrapped.episode_length_buf = value
+
+    def _split_obs(self, obs_dict, extras=None):
+        if extras is None:
+            extras = {}
+        extras["observations"] = {key: value for key, value in obs_dict.items() if key != "policy"}
+        return obs_dict["policy"], extras
+
+    def reset(self):
+        obs_dict, extras = self.env.reset()
+        return self._split_obs(obs_dict, extras)
+
+    def get_observations(self):
+        if hasattr(self.unwrapped, "observation_manager"):
+            obs_dict = self.unwrapped.observation_manager.compute()
+        else:
+            obs_dict = self.unwrapped._get_observations()
+        return self._split_obs(obs_dict, {})
+
+    def step(self, actions):
+        obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
+        dones = (terminated | truncated).to(dtype=torch.long)
+        if not self.unwrapped.cfg.is_finite_horizon:
+            extras["time_outs"] = truncated
+        obs, extras = self._split_obs(obs_dict, extras)
+        return obs, rew, dones, extras
+
+    def close(self):
+        return self.env.close()
+
+
+def _set_motion_file(env_cfg, motion_file: str | None) -> None:
+    if motion_file is None:
+        return
+    if hasattr(env_cfg.commands.motion, "motion_files"):
+        env_cfg.commands.motion.motion_files = [motion_file]
+    if hasattr(env_cfg.commands.motion, "motion_file"):
+        env_cfg.commands.motion.motion_file = motion_file
+
+
+def _apply_play_robot_pose_range(env_cfg, pose_range: list[float] | None) -> None:
+    if pose_range is None:
+        return
+    x_range, y_range, yaw_range_deg = [abs(float(value)) for value in pose_range]
+    pose_cfg = dict(getattr(env_cfg.commands.motion, "pose_range", {}) or {})
+    pose_cfg["x"] = (-x_range, x_range)
+    pose_cfg["y"] = (-y_range, y_range)
+    pose_cfg["yaw"] = (-math.radians(yaw_range_deg), math.radians(yaw_range_deg))
+    env_cfg.commands.motion.pose_range = pose_cfg
+    print(
+        "[INFO]: Play robot pose randomization override: "
+        f"x=+/-{x_range:.3f} m, y=+/-{y_range:.3f} m, yaw=+/-{yaw_range_deg:.1f} deg"
+    )
+
+
+def _apply_play_face_goal(env_cfg, enabled: bool, yaw_offset_deg: float) -> None:
+    if not enabled:
+        return
+    env_cfg.commands.motion.align_initial_heading_to_destination = True
+    env_cfg.commands.motion.align_initial_heading_yaw_offset = math.radians(float(yaw_offset_deg))
+    pose_cfg = dict(getattr(env_cfg.commands.motion, "pose_range", {}) or {})
+    pose_cfg["yaw"] = (0.0, 0.0)
+    env_cfg.commands.motion.pose_range = pose_cfg
+    print(
+        "[INFO]: Play face-goal override enabled: robot and ball layout will be yaw-aligned "
+        f"to the target goal with extra yaw offset {float(yaw_offset_deg):.1f} deg"
+    )
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    _apply_play_robot_pose_range(env_cfg, args_cli.play_robot_pose_range)
+    _apply_play_face_goal(env_cfg, args_cli.play_face_goal, args_cli.play_face_goal_yaw_offset_deg)
 
     env_cfg.viewer.origin_type = None
     env_cfg.viewer.asset_name = None
@@ -99,16 +225,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         if args_cli.motion_file is not None:
             print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
-            env_cfg.commands.motion.motion_file = args_cli.motion_file
+            _set_motion_file(env_cfg, args_cli.motion_file)
 
         art = next((a for a in wandb_run.used_artifacts() if a.type == "motions"), None)
         if art is None:
             print("[WARN] No model artifact found in the run.")
         else:
-            env_cfg.commands.motion.motion_file = str(pathlib.Path(art.download()) / "motion.npz")
+            _set_motion_file(env_cfg, str(pathlib.Path(art.download()) / "motion.npz"))
 
     else:
-        env_cfg.commands.motion.motion_file = args_cli.motion_file
+        _set_motion_file(env_cfg, args_cli.motion_file)
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
@@ -150,12 +276,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     
     ckpt = args_cli.checkpoint.split('_')[1].split('.')[0]
     filename = f"policy_{ckpt}.onnx"
+    export_motion_name = os.path.basename(args_cli.motion_file) if args_cli.motion_file is not None else None
     export_motion_policy_as_onnx(
         env.unwrapped,
         ppo_runner.alg.policy,
         normalizer=ppo_runner.obs_normalizer,
         path=export_model_dir,
         filename=filename,
+        motion_name=export_motion_name,
     )
     attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir, filename=filename)
     # reset environment

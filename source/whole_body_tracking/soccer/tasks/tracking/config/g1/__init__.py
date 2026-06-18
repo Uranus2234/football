@@ -117,6 +117,94 @@ gym.register(
 )
 
 
+gym.register(
+    id="Tracking-Flat-G1-NearFieldKick-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1FlatNearFieldKickEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Tracking-Flat-G1-NearFieldKick-RNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1FlatNearFieldKickEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatRecurrentPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Tracking-Flat-G1-NearFieldGoalKick-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1FlatNearFieldGoalKickEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Tracking-Flat-G1-NearFieldGoalKick-RNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1FlatNearFieldGoalKickEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatRecurrentPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Tracking-Flat-G1-NearFieldGoalKickV2-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1FlatNearFieldGoalKickV2EnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Tracking-Flat-G1-NearFieldGoalKickV2-RNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1FlatNearFieldGoalKickV2EnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatRecurrentPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Tracking-Flat-G1-NearFieldGoalKickV3-RNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1FlatNearFieldGoalKickV3EnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatRecurrentLargePPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Tracking-Flat-G1-NearFieldGoalKick-D455-RNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1FlatNearFieldGoalKickD455EnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatRecurrentPPORunnerCfg",
+    },
+)
+
+
 
 
 ## Advanced Soccer environments

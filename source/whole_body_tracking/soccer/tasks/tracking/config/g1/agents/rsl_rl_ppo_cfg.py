@@ -13,6 +13,7 @@ class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 100000
     save_interval = 1000
     experiment_name = "g1_flat"
+    logger = "tensorboard"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
@@ -46,6 +47,24 @@ class G1FlatRecurrentPPORunnerCfg(G1FlatPPORunnerCfg):
             init_noise_std=1.0,
             actor_hidden_dims=[128, 64, 32],
             critic_hidden_dims=[128, 64, 32],
+            activation="elu",
+
+            rnn_type="lstm",
+            rnn_hidden_dim=128,
+            rnn_num_layers=2,
+        )
+
+
+@configclass
+class G1FlatRecurrentLargePPORunnerCfg(G1FlatPPORunnerCfg):
+    """RNN PPO with a BeyondMimic-sized MLP trunk and unchanged LSTM state shape."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.policy = RslRlPpoActorCriticRecurrentCfg(
+            init_noise_std=1.0,
+            actor_hidden_dims=[512, 256, 128],
+            critic_hidden_dims=[512, 256, 128],
             activation="elu",
 
             rnn_type="lstm",

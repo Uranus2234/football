@@ -19,7 +19,7 @@ Yuhang Lin,
 [![Project](https://img.shields.io/badge/Project-Page-lightblue)](https://soccer-humanoid.github.io/)
 [![arXiv](https://img.shields.io/badge/arXiv-2602.05310-A42C25?style=flat&logo=arXiv&logoColor=A42C25)](https://arxiv.org/abs/2602.05310)
 [![PDF](https://img.shields.io/badge/Paper-PDF-yellow?style=flat&logo=arXiv&logoColor=yellow)](https://soccer-humanoid.github.io/static/Soccer_arxiv.pdf)
-[![Code](https://img.shields.io/badge/Code-GitHub-black?style=flat&logo=github)](https://github.com/TeleHuman/HumanoidSoccer)
+[![Code](https://img.shields.io/badge/Code-GitHub-black?style=flat&logo=github)](https://github.com/Uranus2234/football)
 
 </div>
 
@@ -53,10 +53,10 @@ The kick motions used in our paper are publicly released in [`motions`](motions)
 
 ```bash
 # Option 1: SSH
-git clone git@github.com:TeleHuman/HumanoidSoccer.git
+git clone git@github.com:Uranus2234/football.git
 
 # Option 2: HTTPS
-git clone https://github.com/TeleHuman/HumanoidSoccer.git
+git clone https://github.com/Uranus2234/football.git
 ```
 
 - Using a Python interpreter that has Isaac Lab installed, install the library
@@ -64,6 +64,12 @@ git clone https://github.com/TeleHuman/HumanoidSoccer.git
 ```bash
 pip install -e source/whole_body_tracking
 ```
+
+This training fork keeps the Soccer_Lab assets required by the G1 near-field
+goal-kick tasks inside the repository under
+`source/whole_body_tracking/soccer/assets/soccer_lab_data`.  You do not need to
+clone Soccer_Lab separately for V3 training.  If you want to use a full external
+Soccer_Lab checkout instead, set `SOCCER_LAB_ROOT=/path/to/Soccer_Lab`.
 
 ## Training & Play Example
 ### Training
@@ -79,6 +85,59 @@ python scripts/rsl_rl/train_multi.py --task Tracking-Flat-G1-SoccerDestination-R
 python scripts/rsl_rl/play_multi.py --task Tracking-Flat-G1-SoccerDestination-RNN-v0 \
     --motion_path motions/soccer-standard \
     --num_envs 1  
+```
+
+### Near-field static-ball kick
+
+`Tracking-Flat-G1-NearFieldKick-RNN-v0` is the deployable static-ball kicker task.  Its actor observation follows the whole-body-tracking no-state-estimation layout: no base linear velocity or global pose, with the local ball supplied as `[ball_base_xyz, ball_valid, ball_age_s]` and the global localization reduced to a 2D desired kick direction in the robot frame.
+
+```bash
+python scripts/rsl_rl/train_multi.py --task Tracking-Flat-G1-NearFieldKick-RNN-v0 \
+    --motion_path motions/soccer-standard \
+    --num_envs 8192 \
+    --headless
+```
+
+```bash
+python scripts/rsl_rl/play_multi.py --task Tracking-Flat-G1-NearFieldKick-RNN-v0 \
+    --motion_path motions/soccer-standard \
+    --num_envs 1
+```
+
+### Near-field goal kick V3
+
+`Tracking-Flat-G1-NearFieldGoalKickV3-RNN-v0` is the current from-scratch
+static-ball goal-kick task.  It keeps the deployable 161-dim actor observation,
+uses a larger recurrent PPO policy, and adds goal-center, ball-speed,
+inside-foot-contact, root-mimic, actuator-delay, and sim-to-real randomization
+terms.  TensorBoard is the default logger.
+
+Smoke test:
+
+```bash
+WANDB_MODE=disabled WANDB_DISABLED=true TERM=xterm \
+python scripts/rsl_rl/train_multi.py \
+    --task Tracking-Flat-G1-NearFieldGoalKickV3-RNN-v0 \
+    --motion_path motions/soccer-standard \
+    --num_envs 64 \
+    --max_iterations 2 \
+    --headless \
+    --logger tensorboard \
+    --run_name smoke64_nearfield_goal_gate_v3
+```
+
+Main training:
+
+```bash
+WANDB_MODE=disabled WANDB_DISABLED=true TERM=xterm \
+python scripts/rsl_rl/train_multi.py \
+    --task Tracking-Flat-G1-NearFieldGoalKickV3-RNN-v0 \
+    --motion_path motions/soccer-standard \
+    --num_envs 4096 \
+    --max_iterations 10000 \
+    --headless \
+    --logger tensorboard \
+    --run_name nearfield_goal_gate_v3_large_rnn_sim2real
 ```
 
 ## Progressive Training & Play

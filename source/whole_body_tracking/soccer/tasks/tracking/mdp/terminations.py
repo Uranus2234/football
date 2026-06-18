@@ -16,6 +16,12 @@ from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
 from soccer.tasks.tracking.mdp.rewards import _get_body_indexes
 
 
+def _quat_apply_inverse(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    if hasattr(math_utils, "quat_apply_inverse"):
+        return math_utils.quat_apply_inverse(quat, vec)
+    return math_utils.quat_apply(math_utils.quat_inv(quat), vec)
+
+
 def bad_anchor_pos(env: ManagerBasedRLEnv, command_name: str, threshold: float) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     return torch.norm(command.anchor_pos_w - command.robot_anchor_pos_w, dim=1) > threshold
@@ -32,9 +38,9 @@ def bad_anchor_ori(
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
 
     command: MotionCommand = env.command_manager.get_term(command_name)
-    motion_projected_gravity_b = math_utils.quat_apply_inverse(command.anchor_quat_w, asset.data.GRAVITY_VEC_W)
+    motion_projected_gravity_b = _quat_apply_inverse(command.anchor_quat_w, asset.data.GRAVITY_VEC_W)
 
-    robot_projected_gravity_b = math_utils.quat_apply_inverse(command.robot_anchor_quat_w, asset.data.GRAVITY_VEC_W)
+    robot_projected_gravity_b = _quat_apply_inverse(command.robot_anchor_quat_w, asset.data.GRAVITY_VEC_W)
 
     return (motion_projected_gravity_b[:, 2] - robot_projected_gravity_b[:, 2]).abs() > threshold
 

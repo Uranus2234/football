@@ -34,7 +34,7 @@ class MultiMotionLoader:
     def __init__(self, motion_files: list[str], body_indexes: Sequence[int], device: str = "cpu"):
         assert len(motion_files) > 0, "motion_files must not be empty"
         self.num_files = len(motion_files)
-        self._body_indexes = body_indexes
+        self._body_indexes = torch.as_tensor(body_indexes, dtype=torch.long, device=device)
         self.device = device
 
         # Temporarily store data from each file.
@@ -105,6 +105,13 @@ class MultiMotionLoader:
         self._body_quat_w = pad_tensor_list(body_quat_w_list)
         self._body_lin_vel_w = pad_tensor_list(body_lin_vel_w_list)
         self._body_ang_vel_w = pad_tensor_list(body_ang_vel_w_list)
+        if self._body_indexes.numel() > 0:
+            max_body_index = int(torch.max(self._body_indexes).item())
+            if max_body_index >= self._body_pos_w.shape[2]:
+                raise ValueError(
+                    f"motion body index {max_body_index} is out of range for motion body dimension "
+                    f"{self._body_pos_w.shape[2]}"
+                )
 
         self.time_step_total = max_T  # Maximum frame count.
         self.file_lengths = torch.tensor([jp.shape[0] for jp in joint_pos_list],
@@ -136,15 +143,15 @@ class MultiMotionLoader:
     def get_last_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int, motion_length: int) -> torch.Tensor:
         """Get the anchor position at the last frame of the specified motion."""
         last_frame_idx = motion_length - 1
-        return self._body_pos_w[motion_idx, last_frame_idx, anchor_body_idx]
+        return self.body_pos_w[motion_idx, last_frame_idx, anchor_body_idx]
 
     def get_first_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int) -> torch.Tensor:
         """Get the anchor position at the first frame of the specified motion."""
-        return self._body_pos_w[motion_idx, 0, anchor_body_idx]
+        return self.body_pos_w[motion_idx, 0, anchor_body_idx]
 
     def get_first_frame_anchor_quat(self, motion_idx: int, anchor_body_idx: int) -> torch.Tensor:
         """Get the anchor orientation at the first frame of the specified motion."""
-        return self._body_quat_w[motion_idx, 0, anchor_body_idx]
+        return self.body_quat_w[motion_idx, 0, anchor_body_idx]
 
 
 class MotionCommand(CommandTerm):
@@ -176,8 +183,44 @@ class MotionCommand(CommandTerm):
         self.body_indexes = torch.tensor(
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
         )
+        robot_joint_names = list(getattr(self.robot, "joint_names", []))
+        controlled_joint_names = self.cfg.controlled_joint_names
+        if controlled_joint_names is None:
+            controlled_joint_names = robot_joint_names
+        self.controlled_joint_names = tuple(controlled_joint_names)
+        self.controlled_joint_ids = torch.tensor(
+            self.robot.find_joints(list(self.controlled_joint_names), preserve_order=True)[0],
+            dtype=torch.long,
+            device=self.device,
+        )
+        if self.controlled_joint_ids.numel() != len(self.controlled_joint_names):
+            resolved = [robot_joint_names[i] for i in self.controlled_joint_ids.detach().cpu().tolist()]
+            missing = sorted(set(self.controlled_joint_names) - set(resolved))
+            raise RuntimeError(f"could not resolve controlled robot joints: {missing}")
 
-        self.motion = MultiMotionLoader(self.cfg.motion_files, self.body_indexes, device=self.device)
+        sensor_hold_pos = dict(getattr(self.cfg, "sensor_joint_hold_pos", {}) or {})
+        self.sensor_joint_names = tuple(name for name in sensor_hold_pos if name in robot_joint_names)
+        self.sensor_joint_ids = torch.tensor(
+            self.robot.find_joints(list(self.sensor_joint_names), preserve_order=True)[0],
+            dtype=torch.long,
+            device=self.device,
+        ) if self.sensor_joint_names else torch.empty(0, dtype=torch.long, device=self.device)
+        self.sensor_joint_hold_pos = (
+            torch.tensor([sensor_hold_pos[name] for name in self.sensor_joint_names], dtype=torch.float32, device=self.device)
+            if self.sensor_joint_names
+            else torch.empty(0, dtype=torch.float32, device=self.device)
+        )
+
+        motion_body_indexes = self.cfg.motion_body_indexes
+        if motion_body_indexes is None:
+            motion_body_indexes = self.body_indexes
+        self.motion = MultiMotionLoader(self.cfg.motion_files, motion_body_indexes, device=self.device)
+        motion_joint_dim = int(self.motion.joint_pos.shape[-1])
+        if motion_joint_dim != int(self.controlled_joint_ids.numel()):
+            raise RuntimeError(
+                f"motion joint dimension {motion_joint_dim} does not match controlled joints "
+                f"{int(self.controlled_joint_ids.numel())}; set MotionCommandCfg.controlled_joint_names explicitly"
+            )
         kick_leg_to_id = {"left": 0, "right": 1}
         self._kick_leg_id_to_name = {v: k for k, v in kick_leg_to_id.items()}
         self._kick_leg_id_to_name[-1] = "unknown"
@@ -190,6 +233,10 @@ class MotionCommand(CommandTerm):
                 self.motion_kick_leg_names.append(normalized)
             else:
                 self.motion_kick_leg_names.append("unknown")
+        self.motion_indices_by_kick_leg = {
+            leg_id: torch.nonzero(self.motion_kick_leg == leg_id, as_tuple=False).squeeze(-1)
+            for leg_id in kick_leg_to_id.values()
+        }
 
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -227,6 +274,23 @@ class MotionCommand(CommandTerm):
         self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["goal_success_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["goal_gate_miss_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["gate_lateral_error"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["gate_cross_speed"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["goal_gate_stage"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["goal_init_stage"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["goal_init_robot_x"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["goal_init_robot_y"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["goal_init_ball_base_x"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["goal_init_ball_base_y"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["goal_init_yaw_error_abs"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["expected_left_foot_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["expected_right_foot_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["sim2real_perception_latency_steps"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["sim2real_perception_latency_s"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["sim2real_actuator_delay_steps"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["sim2real_actuator_delay_max_steps"] = torch.zeros(self.num_envs, device=self.device)
 
         # Target-point and soccer-ball generation logic.
         self.target_point_pos = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
@@ -234,6 +298,22 @@ class MotionCommand(CommandTerm):
         self.target_destination_pos = torch.zeros_like(self.target_point_pos)
         # Save initial target position at resample for kick-direction computation.
         self.initial_target_point_pos = torch.zeros_like(self.target_point_pos)
+        self.goal_gate_prev_ball_pos = torch.zeros_like(self.target_point_pos)
+        self.goal_gate_success_awarded = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.goal_gate_miss_awarded = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.goal_gate_lateral_error = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.goal_gate_cross_speed = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.goal_gate_last_event_step = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self.goal_gate_center_score = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.goal_gate_edge_hit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.reference_initial_anchor_pos_w = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
+        self.initial_heading_yaw_delta = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.goal_aware_root_pos_xy = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=self.device)
+        self.goal_aware_root_yaw = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.goal_aware_yaw_error_abs = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.goal_aware_ball_base_xy = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=self.device)
+        self.goal_aware_init_stage = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.goal_aware_root_override_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
         # Blind-zone logic: ball is invisible when robot-ball (x, y) distance is out of range.
         self.blind_distance_min = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
@@ -242,14 +322,37 @@ class MotionCommand(CommandTerm):
         self.last_visible_target_point_base = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
         # Whether currently in blind zone.
         self.is_in_blind_zone = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.perception_latched_target_point_base = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
+        self.perception_ball_age_s = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.perception_ball_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.perception_last_update_step = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        step_dt = float(getattr(env, "step_dt", env.cfg.decimation * env.cfg.sim.dt))
+        latency_range = getattr(cfg, "perception_ball_latency_range_s", (0.0, 0.0))
+        self.perception_max_latency_steps = max(0, int(math.ceil(max(latency_range) / max(step_dt, 1e-6))))
+        self.perception_ball_latency_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.perception_history_write_index = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.perception_history_last_step = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self.perception_history_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.perception_target_point_base_history = torch.zeros(
+            self.num_envs,
+            self.perception_max_latency_steps + 1,
+            3,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.kick_latch_start_phase = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.post_trigger_ball_dropout_prob = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.kick_direction_yaw_noise = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.kick_direction_latched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.latched_kick_direction_base = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=self.device)
         
         # Height for target_destination.
         self.destination_height = 0.11
         
         # target_destination generation parameters (world-frame based).
-        self.destination_center = torch.tensor([0.0, -5.0, self.destination_height], device=self.device)  # Rectangle center (x, y, z).
-        self.destination_length = 1.0  # Rectangle length (x-axis).
-        self.destination_width = 0.5  # Rectangle width (y-axis).
+        self.destination_center = torch.tensor(self.cfg.target_destination_center, dtype=torch.float32, device=self.device)
+        self.destination_length = float(self.cfg.target_destination_length)  # Rectangle length (x-axis).
+        self.destination_width = float(self.cfg.target_destination_width)  # Rectangle width (y-axis).
         
         self.curve_radius_offset = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._radius_offset_min = None
@@ -272,9 +375,16 @@ class MotionCommand(CommandTerm):
 
         all_env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         self._sample_soccer_offset(all_env_ids)
-        self._compute_soccer_ball_positions(all_env_ids)
+        self._update_destination_points(all_env_ids)
+        if bool(getattr(self.cfg, "enable_goal_aware_initialization", False)):
+            self._sample_goal_aware_initial_layout(all_env_ids)
+        else:
+            self._compute_soccer_ball_positions(all_env_ids)
+            self._align_initial_layout_to_destination(all_env_ids)
         self._update_soccer_ball(all_env_ids)
         self._update_target_points(all_env_ids)
+        self._reset_perception_randomization(all_env_ids)
+        self._reset_goal_gate_state(all_env_ids)
 
     @property
     def command(self) -> torch.Tensor:
@@ -322,11 +432,11 @@ class MotionCommand(CommandTerm):
 
     @property
     def robot_joint_pos(self) -> torch.Tensor:
-        return self.robot.data.joint_pos
+        return self.robot.data.joint_pos[:, self.controlled_joint_ids]
 
     @property
     def robot_joint_vel(self) -> torch.Tensor:
-        return self.robot.data.joint_vel
+        return self.robot.data.joint_vel[:, self.controlled_joint_ids]
 
     @property
     def robot_body_pos_w(self) -> torch.Tensor:
@@ -398,6 +508,127 @@ class MotionCommand(CommandTerm):
         rand = torch.rand(ids.numel(), device=self.device)
         span = self._radius_offset_max - self._radius_offset_min
         self.curve_radius_offset[ids] = self._radius_offset_min + rand * span
+
+    def _goal_aware_curriculum_alpha(self) -> tuple[float, float]:
+        steps = getattr(self.cfg, "goal_aware_curriculum_steps", (48000, 144000, 288000))
+        stage_a_end, stage_b_end, stage_c_end = [int(x) for x in steps]
+        step_counter = getattr(self._env, "common_step_counter", 0)
+        if isinstance(step_counter, torch.Tensor):
+            step = int(step_counter.item())
+        else:
+            step = int(step_counter)
+
+        if step <= stage_a_end:
+            return 0.0, 0.0
+        if step <= stage_b_end:
+            alpha = (step - stage_a_end) / max(float(stage_b_end - stage_a_end), 1.0)
+            return alpha, 1.0 + alpha
+        if step <= stage_c_end:
+            alpha = (step - stage_b_end) / max(float(stage_c_end - stage_b_end), 1.0)
+            return 1.0 + alpha, 2.0 + alpha
+        return 2.0, 3.0
+
+    @staticmethod
+    def _lerp_pair(a: Sequence[float], b: Sequence[float], alpha: float) -> tuple[float, float]:
+        return (
+            float(a[0]) + alpha * (float(b[0]) - float(a[0])),
+            float(a[1]) + alpha * (float(b[1]) - float(a[1])),
+        )
+
+    def _goal_aware_range(self, name: str, alpha: float) -> tuple[float, float]:
+        ranges = getattr(self.cfg, name)
+        if alpha <= 0.0:
+            return float(ranges[0][0]), float(ranges[0][1])
+        if alpha <= 1.0:
+            return self._lerp_pair(ranges[0], ranges[1], alpha)
+        if alpha <= 2.0:
+            return self._lerp_pair(ranges[1], ranges[2], alpha - 1.0)
+        return float(ranges[2][0]), float(ranges[2][1])
+
+    def _sample_uniform_range(self, value_range: tuple[float, float], shape: tuple[int, ...]) -> torch.Tensor:
+        low, high = value_range
+        if abs(high - low) < 1e-8:
+            return torch.full(shape, low, dtype=torch.float32, device=self.device)
+        return low + torch.rand(shape, dtype=torch.float32, device=self.device) * (high - low)
+
+    def _sample_goal_aware_initial_layout(self, env_ids: Sequence[int] | torch.Tensor):
+        ids = self._to_env_id_tensor(env_ids)
+        if ids.numel() == 0:
+            return
+
+        alpha, stage = self._goal_aware_curriculum_alpha()
+        x_range = self._goal_aware_range("goal_aware_robot_x_ranges", alpha)
+        y_range = self._goal_aware_range("goal_aware_robot_y_ranges", alpha)
+        yaw_error_range = self._goal_aware_range("goal_aware_yaw_error_ranges", alpha)
+        ball_x_range = self._goal_aware_range("goal_aware_ball_x_front_ranges", alpha)
+        if bool(getattr(self.cfg, "goal_aware_ball_lateral_by_kick_leg", False)):
+            ball_y_abs_range = self._goal_aware_range("goal_aware_ball_y_lat_abs_ranges", alpha)
+            ball_y_range = (-ball_y_abs_range[1], ball_y_abs_range[1])
+        else:
+            ball_y_range = self._goal_aware_range("goal_aware_ball_y_lat_ranges", alpha)
+
+        robot_x = self._sample_uniform_range(x_range, (ids.numel(),))
+        robot_y = self._sample_uniform_range(y_range, (ids.numel(),))
+
+        # Mirror the attack-half x ranges automatically if the configured goal is on -x.
+        goal_x = self.target_destination_pos[ids, 0]
+        attack_sign = torch.where(goal_x >= 0.0, torch.ones_like(goal_x), -torch.ones_like(goal_x))
+        robot_xy = torch.stack((robot_x * attack_sign, robot_y), dim=-1)
+        goal_xy = self.target_destination_pos[ids, :2]
+
+        yaw_to_goal = torch.atan2(goal_xy[:, 1] - robot_xy[:, 1], goal_xy[:, 0] - robot_xy[:, 0])
+        yaw_error = self._sample_uniform_range(yaw_error_range, (ids.numel(),))
+        robot_yaw = yaw_to_goal + yaw_error
+
+        root_quat = self.motion.body_quat_w[self.motion_idx[ids], self.time_steps[ids], 0]
+        root_forward = quat_apply(
+            root_quat,
+            torch.tensor([1.0, 0.0, 0.0], dtype=root_quat.dtype, device=self.device).expand(ids.numel(), -1),
+        )
+        root_yaw = torch.atan2(root_forward[:, 1], root_forward[:, 0])
+        self.initial_heading_yaw_delta[ids] = robot_yaw - root_yaw
+
+        ball_base_x = self._sample_uniform_range(ball_x_range, (ids.numel(),))
+        if bool(getattr(self.cfg, "goal_aware_ball_lateral_by_kick_leg", False)):
+            ball_y_abs = self._sample_uniform_range(ball_y_abs_range, (ids.numel(),))
+            kick_leg = self.motion_kick_leg[self.motion_idx[ids]]
+            y_sign = torch.where(kick_leg == 0, torch.ones_like(ball_y_abs), -torch.ones_like(ball_y_abs))
+            known_leg = (kick_leg == 0) | (kick_leg == 1)
+            random_y = self._sample_uniform_range(ball_y_range, (ids.numel(),))
+            ball_base_y = torch.where(known_leg, y_sign * ball_y_abs, random_y)
+        else:
+            ball_base_y = self._sample_uniform_range(ball_y_range, (ids.numel(),))
+        c = torch.cos(robot_yaw)
+        s = torch.sin(robot_yaw)
+        ball_xy = robot_xy + torch.stack(
+            (
+                ball_base_x * c - ball_base_y * s,
+                ball_base_x * s + ball_base_y * c,
+            ),
+            dim=-1,
+        )
+
+        self.goal_aware_root_pos_xy[ids] = robot_xy
+        self.goal_aware_root_yaw[ids] = robot_yaw
+        self.goal_aware_yaw_error_abs[ids] = torch.abs(yaw_error)
+        self.goal_aware_ball_base_xy[ids] = torch.stack((ball_base_x, ball_base_y), dim=-1)
+        self.goal_aware_init_stage[ids] = stage
+        self.goal_aware_root_override_valid[ids] = True
+
+        self.soccer_ball_pos[ids, :2] = ball_xy
+        self.soccer_ball_pos[ids, 2] = float(self._target_height)
+        self.initial_target_point_pos[ids] = self.soccer_ball_pos[ids]
+        self.target_point_pos[ids] = self.soccer_ball_pos[ids]
+
+        self.metrics["goal_init_stage"][ids] = stage
+        self.metrics["goal_init_robot_x"][ids] = robot_xy[:, 0]
+        self.metrics["goal_init_robot_y"][ids] = robot_xy[:, 1]
+        self.metrics["goal_init_ball_base_x"][ids] = ball_base_x
+        self.metrics["goal_init_ball_base_y"][ids] = ball_base_y
+        self.metrics["goal_init_yaw_error_abs"][ids] = torch.abs(yaw_error)
+        expected_leg = self.motion_kick_leg[self.motion_idx[ids]]
+        self.metrics["expected_left_foot_rate"][ids] = (expected_leg == 0).to(torch.float32)
+        self.metrics["expected_right_foot_rate"][ids] = (expected_leg == 1).to(torch.float32)
 
     def _update_metrics(self):
         self.metrics["error_anchor_pos"] = torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1)
@@ -515,7 +746,18 @@ class MotionCommand(CommandTerm):
     def _uniform_sampling(self, env_ids: Sequence[int]):
         # Sample motion and time-step separately to avoid out-of-range issues.
         # First, sample motions.
-        motion_indices = torch.randint(0, self.motion.num_files, (len(env_ids),), device=self.device)
+        if bool(getattr(self.cfg, "balance_motion_kick_leg_sampling", False)):
+            requested_legs = torch.randint(0, 2, (len(env_ids),), device=self.device)
+            motion_indices = torch.empty(len(env_ids), dtype=torch.long, device=self.device)
+            fallback = torch.randint(0, self.motion.num_files, (len(env_ids),), device=self.device)
+            motion_indices[:] = fallback
+            for leg_id, candidates in self.motion_indices_by_kick_leg.items():
+                leg_mask = requested_legs == int(leg_id)
+                if torch.any(leg_mask) and candidates.numel() > 0:
+                    choice = torch.randint(0, candidates.numel(), (int(leg_mask.sum().item()),), device=self.device)
+                    motion_indices[leg_mask] = candidates[choice]
+        else:
+            motion_indices = torch.randint(0, self.motion.num_files, (len(env_ids),), device=self.device)
         self.motion_idx[env_ids] = motion_indices
         self.motion_length[env_ids] = self.motion.file_lengths[motion_indices]
         
@@ -599,6 +841,8 @@ class MotionCommand(CommandTerm):
         env_origins = getattr(self._env.scene, "env_origins", None)
         if env_origins is None:
             return
+
+        self.goal_gate_prev_ball_pos[:] = self.target_point_pos
         
         # Read world-space soccer-ball position from simulation.
         ball_world_pos = self.soccer_ball.data.root_pos_w  # [num_envs, 3]
@@ -631,6 +875,163 @@ class MotionCommand(CommandTerm):
             else:
                 world_destination = self.target_destination_pos
             self.target_destination_marker.visualize(world_destination)
+
+    def _align_initial_layout_to_destination(self, env_ids: Sequence[int] | torch.Tensor):
+        ids = self._to_env_id_tensor(env_ids)
+        if ids.numel() == 0:
+            return
+        if not bool(getattr(self.cfg, "align_initial_heading_to_destination", False)):
+            self.initial_heading_yaw_delta[ids] = 0.0
+            return
+
+        root_pos_local = self.motion.body_pos_w[self.motion_idx[ids], self.time_steps[ids], 0]
+        root_quat = self.motion.body_quat_w[self.motion_idx[ids], self.time_steps[ids], 0]
+        forward = quat_apply(
+            root_quat,
+            torch.tensor([1.0, 0.0, 0.0], dtype=root_pos_local.dtype, device=self.device).expand(ids.numel(), -1),
+        )
+        current_yaw = torch.atan2(forward[:, 1], forward[:, 0])
+
+        destination_delta = self.target_destination_pos[ids, :2] - root_pos_local[:, :2]
+        destination_yaw = torch.atan2(destination_delta[:, 1], destination_delta[:, 0])
+        yaw_delta = destination_yaw - current_yaw + float(getattr(self.cfg, "align_initial_heading_yaw_offset", 0.0))
+        self.initial_heading_yaw_delta[ids] = yaw_delta
+
+        c = torch.cos(yaw_delta)
+        s = torch.sin(yaw_delta)
+        rel_ball = self.soccer_ball_pos[ids, :2] - root_pos_local[:, :2]
+        rotated_ball_xy = torch.stack(
+            (
+                rel_ball[:, 0] * c - rel_ball[:, 1] * s,
+                rel_ball[:, 0] * s + rel_ball[:, 1] * c,
+            ),
+            dim=-1,
+        )
+        self.soccer_ball_pos[ids, :2] = root_pos_local[:, :2] + rotated_ball_xy
+
+    def _reset_perception_randomization(self, env_ids: Sequence[int] | torch.Tensor):
+        ids = self._to_env_id_tensor(env_ids)
+        if ids.numel() == 0:
+            return
+
+        latch_low, latch_high = self.cfg.kick_latch_start_phase_range
+        dropout_low, dropout_high = self.cfg.post_trigger_ball_dropout_prob_range
+        yaw_low, yaw_high = self.cfg.kick_direction_yaw_noise_range
+
+        self.kick_latch_start_phase[ids] = latch_low + torch.rand(ids.numel(), device=self.device) * (latch_high - latch_low)
+        self.post_trigger_ball_dropout_prob[ids] = dropout_low + torch.rand(ids.numel(), device=self.device) * (dropout_high - dropout_low)
+        self.kick_direction_yaw_noise[ids] = yaw_low + torch.rand(ids.numel(), device=self.device) * (yaw_high - yaw_low)
+        self.perception_latched_target_point_base[ids] = 0.0
+        self.perception_ball_age_s[ids] = 0.0
+        self.perception_ball_valid[ids] = False
+        self.perception_last_update_step[ids] = -1
+        latency_low, latency_high = getattr(self.cfg, "perception_ball_latency_range_s", (0.0, 0.0))
+        step_dt = float(getattr(self._env, "step_dt", self._env.cfg.decimation * self._env.cfg.sim.dt))
+        min_steps = max(0, int(round(float(latency_low) / max(step_dt, 1e-6))))
+        max_steps = max(min_steps, int(round(float(latency_high) / max(step_dt, 1e-6))))
+        max_steps = min(max_steps, self.perception_max_latency_steps)
+        if max_steps > min_steps:
+            self.perception_ball_latency_steps[ids] = torch.randint(
+                min_steps,
+                max_steps + 1,
+                (ids.numel(),),
+                dtype=torch.long,
+                device=self.device,
+            )
+        else:
+            self.perception_ball_latency_steps[ids] = min_steps
+        self.perception_history_write_index[ids] = 0
+        self.perception_history_last_step[ids] = -1
+        self.perception_history_valid[ids] = False
+        self.perception_target_point_base_history[ids] = 0.0
+        self.kick_direction_latched[ids] = False
+        self.latched_kick_direction_base[ids] = 0.0
+        step_dt = float(getattr(self._env, "step_dt", self._env.cfg.decimation * self._env.cfg.sim.dt))
+        self.metrics["sim2real_perception_latency_steps"][ids] = self.perception_ball_latency_steps[ids].to(torch.float32)
+        self.metrics["sim2real_perception_latency_s"][ids] = (
+            self.perception_ball_latency_steps[ids].to(torch.float32) * step_dt
+        )
+        self._refresh_sim2real_actuator_delay_metrics(ids)
+
+    def _refresh_sim2real_actuator_delay_metrics(self, env_ids: Sequence[int] | torch.Tensor):
+        ids = self._to_env_id_tensor(env_ids)
+        if ids.numel() == 0:
+            return
+
+        delay_sum = torch.zeros(ids.numel(), dtype=torch.float32, device=self.device)
+        delay_count = 0
+        max_delay = 0.0
+        for actuator in getattr(self.robot, "actuators", {}).values():
+            cfg = getattr(actuator, "cfg", None)
+            max_delay = max(max_delay, float(getattr(cfg, "max_delay", 0)))
+            delay_buffer = getattr(actuator, "positions_delay_buffer", None)
+            time_lags = getattr(delay_buffer, "time_lags", None)
+            if isinstance(time_lags, torch.Tensor) and time_lags.shape[0] == self.num_envs:
+                delay_sum += time_lags.to(device=self.device, dtype=torch.float32)[ids]
+                delay_count += 1
+
+        if delay_count > 0:
+            self.metrics["sim2real_actuator_delay_steps"][ids] = delay_sum / float(delay_count)
+        else:
+            self.metrics["sim2real_actuator_delay_steps"][ids] = 0.0
+        self.metrics["sim2real_actuator_delay_max_steps"][ids] = max_delay
+
+    def _compose_full_joint_state(
+        self,
+        joint_pos: torch.Tensor,
+        joint_vel: torch.Tensor,
+        env_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        full_joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
+        full_joint_vel = torch.zeros_like(full_joint_pos)
+        full_joint_pos[:, self.controlled_joint_ids] = joint_pos
+        full_joint_vel[:, self.controlled_joint_ids] = joint_vel
+        if self.sensor_joint_ids.numel() > 0:
+            hold = self.sensor_joint_hold_pos.to(device=full_joint_pos.device, dtype=full_joint_pos.dtype)
+            full_joint_pos[:, self.sensor_joint_ids] = hold.unsqueeze(0).expand(env_ids.numel(), -1)
+            full_joint_vel[:, self.sensor_joint_ids] = 0.0
+        return full_joint_pos, full_joint_vel
+
+    def _reset_goal_gate_state(self, env_ids: Sequence[int] | torch.Tensor):
+        ids = self._to_env_id_tensor(env_ids)
+        if ids.numel() == 0:
+            return
+
+        self.goal_gate_prev_ball_pos[ids] = self.target_point_pos[ids]
+        self.goal_gate_success_awarded[ids] = False
+        self.goal_gate_miss_awarded[ids] = False
+        self.goal_gate_lateral_error[ids] = 0.0
+        self.goal_gate_cross_speed[ids] = 0.0
+        self.goal_gate_last_event_step[ids] = -1
+        self.goal_gate_center_score[ids] = 0.0
+        self.goal_gate_edge_hit[ids] = False
+        for metric_name in (
+            "goal_success_rate",
+            "goal_gate_miss_rate",
+            "gate_lateral_error",
+            "gate_cross_speed",
+            "goal_gate_stage",
+            "goal_center_score",
+            "goal_lateral_error_signed",
+            "goal_edge_hit_rate",
+            "goal_cross_speed_reward",
+        ):
+            metric = self.metrics.get(metric_name)
+            if metric is not None and metric.shape[0] == self.num_envs:
+                metric[ids] = 0.0
+
+    def _refresh_relative_body_cache(self):
+        anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
+        anchor_quat_w_repeat = self.anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
+        robot_anchor_pos_w_repeat = self.robot_anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
+        robot_anchor_quat_w_repeat = self.robot_anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
+
+        delta_pos_w = robot_anchor_pos_w_repeat
+        delta_pos_w[..., 2] = anchor_pos_w_repeat[..., 2]
+        delta_ori_w = yaw_quat(quat_mul(robot_anchor_quat_w_repeat, quat_inv(anchor_quat_w_repeat)))
+
+        self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
+        self.body_pos_relative_w = delta_pos_w + quat_apply(delta_ori_w, self.body_pos_w - anchor_pos_w_repeat)
         
 
     def _update_soccer_ball(self, env_ids: Sequence[int] | torch.Tensor):
@@ -684,10 +1085,16 @@ class MotionCommand(CommandTerm):
             self._uniform_sampling(env_ids)
         else:
             raise ValueError(f"Unsupported sampling_strategy: {self.cfg.sampling_strategy}")
-        self._compute_soccer_ball_positions(env_ids)
+        self._update_destination_points(env_ids)
+        if bool(getattr(self.cfg, "enable_goal_aware_initialization", False)):
+            self._sample_goal_aware_initial_layout(env_ids)
+        else:
+            self._compute_soccer_ball_positions(env_ids)
+            self._align_initial_layout_to_destination(env_ids)
         self._update_soccer_ball(env_ids)
         self._update_target_points(env_ids)
-        self._update_destination_points(env_ids)
+        self._reset_perception_randomization(env_ids)
+        self._reset_goal_gate_state(env_ids)
         
         # Sample blind-zone min/max thresholds and reset blind-zone state.
         blind_min_low, blind_min_high = self.cfg.blind_distance_min_range
@@ -702,7 +1109,33 @@ class MotionCommand(CommandTerm):
         root_lin_vel = self.body_lin_vel_w[:, 0].clone()
         root_ang_vel = self.body_ang_vel_w[:, 0].clone()
 
+        goal_aware_enabled = bool(getattr(self.cfg, "enable_goal_aware_initialization", False))
+        if goal_aware_enabled:
+            env_origins = getattr(self._env.scene, "env_origins", None)
+            if env_origins is None:
+                raise RuntimeError("goal-aware initialization requires env.scene.env_origins")
+
+            root_pos[env_ids, :2] = self.goal_aware_root_pos_xy[env_ids] + env_origins[env_ids, :2]
+            heading_delta = self.initial_heading_yaw_delta[env_ids]
+        else:
+            heading_delta = self.initial_heading_yaw_delta[env_ids]
+
+        if torch.any(torch.abs(heading_delta) > 1e-6):
+            heading_delta_quat = quat_from_euler_xyz(
+                torch.zeros_like(heading_delta),
+                torch.zeros_like(heading_delta),
+                heading_delta,
+            )
+            root_ori[env_ids] = quat_mul(heading_delta_quat, root_ori[env_ids])
+            root_lin_vel[env_ids] = quat_apply(heading_delta_quat, root_lin_vel[env_ids])
+            root_ang_vel[env_ids] = quat_apply(heading_delta_quat, root_ang_vel[env_ids])
+
         range_list = [self.cfg.pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+        if goal_aware_enabled:
+            # V2 curriculum owns x/y/yaw so sampled poses stay inside the attack-half and face-goal bounds.
+            range_list[0] = (0.0, 0.0)
+            range_list[1] = (0.0, 0.0)
+            range_list[5] = (0.0, 0.0)
         ranges = torch.tensor(range_list, device=self.device)
         rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
         root_pos[env_ids] += rand_samples[:, 0:3]
@@ -718,15 +1151,18 @@ class MotionCommand(CommandTerm):
         joint_vel = self.joint_vel.clone()
 
         joint_pos += sample_uniform(*self.cfg.joint_position_range, joint_pos.shape, joint_pos.device)
-        soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
+        soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids][:, self.controlled_joint_ids]
         joint_pos[env_ids] = torch.clip(
             joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
         )
-        self.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
+        full_joint_pos, full_joint_vel = self._compose_full_joint_state(joint_pos[env_ids], joint_vel[env_ids], env_ids)
+        self.robot.write_joint_state_to_sim(full_joint_pos, full_joint_vel, env_ids=env_ids)
         self.robot.write_root_state_to_sim(
             torch.cat([root_pos[env_ids], root_ori[env_ids], root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1),
             env_ids=env_ids,
         )
+        self._refresh_relative_body_cache()
+        self.reference_initial_anchor_pos_w[env_ids] = self.robot_anchor_pos_w[env_ids].detach()
 
         # Set resample flag so env can refresh observations on next step.
         flag_name = f"{self._state_prefix}_motion_resampled"
@@ -757,17 +1193,7 @@ class MotionCommand(CommandTerm):
             if torch.any(no_contact_mask):
                 self.initial_target_point_pos[no_contact_mask] = self.target_point_pos[no_contact_mask]
 
-        anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
-        anchor_quat_w_repeat = self.anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
-        robot_anchor_pos_w_repeat = self.robot_anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
-        robot_anchor_quat_w_repeat = self.robot_anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
-
-        delta_pos_w = robot_anchor_pos_w_repeat
-        delta_pos_w[..., 2] = anchor_pos_w_repeat[..., 2]
-        delta_ori_w = yaw_quat(quat_mul(robot_anchor_quat_w_repeat, quat_inv(anchor_quat_w_repeat)))
-
-        self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
-        self.body_pos_relative_w = delta_pos_w + quat_apply(delta_ori_w, self.body_pos_w - anchor_pos_w_repeat)
+        self._refresh_relative_body_cache()
 
         self.bin_failed_count = (
             self.cfg.adaptive_alpha * self._current_bin_failed + (1 - self.cfg.adaptive_alpha) * self.bin_failed_count
@@ -837,9 +1263,16 @@ class MotionCommandCfg(CommandTermCfg):
 
     anchor_body_name: str = MISSING
     body_names: list[str] = MISSING
+    motion_body_indexes: list[int] | None = None
+    controlled_joint_names: list[str] | None = None
+    sensor_joint_hold_pos: dict[str, float] = {}
 
     pose_range: dict[str, tuple[float, float]] = {}
     velocity_range: dict[str, tuple[float, float]] = {}
+    align_initial_heading_to_destination: bool = False
+    align_initial_heading_yaw_offset: float = 0.0
+    align_motion_reference_to_initial_heading: bool = False
+    balance_motion_kick_leg_sampling: bool = False
 
     joint_position_range: tuple[float, float] = (-0.52, 0.52)
     sampling_strategy: str = "uniform"
@@ -868,3 +1301,67 @@ class MotionCommandCfg(CommandTermCfg):
     # Blind-zone config: ball is invisible when robot-ball (x, y) distance is outside [min, max].
     blind_distance_min_range: tuple[float, float] = (0.3, 0.5)  # Minimum distance sampling range.
     blind_distance_max_range: tuple[float, float] = (1.5, 2.0)  # Maximum distance sampling range.
+    # Extra per-step random dropout probability for ball perception while it is otherwise visible.
+    blind_dropout_prob: float = 0.0
+    # Per-step random dropout probability for destination/goal perception.
+    target_destination_dropout_prob: float = 0.0
+
+    # Near-field kick perception/command randomization.
+    near_field_ball_visible_distance_range: tuple[float, float] = (0.15, 1.6)
+    perception_ball_update_period_steps: int = 5
+    perception_ball_noise_std: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    perception_ball_latency_range_s: tuple[float, float] = (0.0, 0.0)
+    kick_latch_start_phase_range: tuple[float, float] = (1.0, 1.0)
+    post_trigger_ball_dropout_prob_range: tuple[float, float] = (0.0, 0.0)
+    kick_direction_yaw_noise_range: tuple[float, float] = (0.0, 0.0)
+
+    # Goal-gate curriculum for near-field goal kicking.
+    goal_gate_curriculum_steps: tuple[int, int, int] = (24000, 72000, 144000)
+    goal_gate_local_distance: float = 1.5
+    goal_gate_mid_distance: float = 3.0
+    goal_gate_local_half_width: float = 0.45
+    goal_gate_mid_half_width: float = 0.65
+    goal_gate_real_half_width: float = 0.9
+    goal_gate_min_cross_speed: float = 0.0
+
+    # Goal-aware initial state curriculum for near-field goal kicking.  These
+    # ranges are field-frame x/y for the robot and base-frame x/y for the ball.
+    enable_goal_aware_initialization: bool = False
+    goal_aware_curriculum_steps: tuple[int, int, int] = (48000, 144000, 288000)
+    goal_aware_robot_x_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] = (
+        (3.5, 6.2),
+        (2.0, 6.2),
+        (0.5, 6.2),
+    )
+    goal_aware_robot_y_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] = (
+        (-2.2, 2.2),
+        (-3.0, 3.0),
+        (-3.8, 3.8),
+    )
+    goal_aware_yaw_error_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] = (
+        (-math.radians(20.0), math.radians(20.0)),
+        (-math.radians(45.0), math.radians(45.0)),
+        (-math.radians(90.0), math.radians(90.0)),
+    )
+    goal_aware_ball_x_front_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] = (
+        (0.35, 0.70),
+        (0.30, 0.85),
+        (0.25, 0.95),
+    )
+    goal_aware_ball_y_lat_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] = (
+        (-0.18, 0.18),
+        (-0.25, 0.25),
+        (-0.35, 0.35),
+    )
+    goal_aware_ball_lateral_by_kick_leg: bool = False
+    goal_aware_ball_y_lat_abs_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] = (
+        (0.06, 0.18),
+        (0.04, 0.25),
+        (0.02, 0.32),
+    )
+
+    # Destination/goal sampling in field coordinates.  Soccer_Lab/Firmware use
+    # field center as origin, long axis as x, and goal centers at x=+/-length/2.
+    target_destination_center: tuple[float, float, float] = (0.0, -5.0, 0.11)
+    target_destination_length: float = 1.0
+    target_destination_width: float = 0.5

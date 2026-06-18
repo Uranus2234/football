@@ -3,7 +3,14 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import math
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WHOLE_BODY_TRACKING_SRC = REPO_ROOT / "source" / "whole_body_tracking"
+if str(WHOLE_BODY_TRACKING_SRC) not in sys.path:
+    sys.path.insert(0, str(WHOLE_BODY_TRACKING_SRC))
 
 from isaaclab.app import AppLauncher
 
@@ -23,6 +30,26 @@ parser.add_argument("--motion_file", type=str, default=None, help="Path to a sin
 parser.add_argument("--motion_path", type=str, default=None, help="The path to the directory containing motion files for random sampling (no export).")
 
 parser.add_argument("--export_motion_name", type=str, default=None, help="Select one motion for exporter (required when --motion_file is used).")
+parser.add_argument(
+    "--play_robot_pose_range",
+    type=float,
+    nargs=3,
+    metavar=("X_M", "Y_M", "YAW_DEG"),
+    default=None,
+    help="Play-only symmetric root randomization override: x/y in meters and yaw in degrees.",
+)
+parser.add_argument(
+    "--play_face_goal",
+    action="store_true",
+    default=False,
+    help="Play-only reset override that rotates the initial robot+ball layout so the robot faces the goal.",
+)
+parser.add_argument(
+    "--play_face_goal_yaw_offset_deg",
+    type=float,
+    default=0.0,
+    help="Extra yaw offset in degrees applied after --play_face_goal alignment.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -39,6 +66,22 @@ sys.argv = [sys.argv[0]] + hydra_args
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+
+# Isaac Lab's URDF converter imports the URDF importer Python module lazily
+# when the robot is spawned.  Some Isaac Sim 4.5 installations do not enable
+# this extension in the default experience, so enable it explicitly.
+try:
+    import omni.kit.app
+
+    ext_manager = omni.kit.app.get_app().get_extension_manager()
+    if not ext_manager.is_extension_enabled("isaacsim.asset.importer.urdf"):
+        ext_manager.set_extension_enabled_immediate("isaacsim.asset.importer.urdf", True)
+    from isaacsim.asset.importer.urdf import _urdf
+
+    if not hasattr(_urdf.ImportConfig, "set_merge_fixed_ignore_inertia"):
+        _urdf.ImportConfig.set_merge_fixed_ignore_inertia = _urdf.ImportConfig.set_merge_fixed_joints
+except Exception as exc:
+    print(f"[WARN] Failed to enable isaacsim.asset.importer.urdf extension: {exc}")
 
 """Rest everything follows."""
 
@@ -58,13 +101,73 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+
+
+class RslRlVecEnvWrapper:
+    """Compatibility wrapper for the TienKung/RSL-RL runner."""
+
+    def __init__(self, env):
+        self.env = env
+        self.num_envs = self.unwrapped.num_envs
+        self.device = self.unwrapped.device
+        self.max_episode_length = self.unwrapped.max_episode_length
+        if hasattr(self.unwrapped, "action_manager"):
+            self.num_actions = self.unwrapped.action_manager.total_action_dim
+        else:
+            self.num_actions = gym.spaces.flatdim(self.unwrapped.single_action_space)
+        self.env.reset()
+
+    @property
+    def cfg(self):
+        return self.unwrapped.cfg
+
+    @property
+    def unwrapped(self):
+        return self.env.unwrapped
+
+    @property
+    def episode_length_buf(self):
+        return self.unwrapped.episode_length_buf
+
+    @episode_length_buf.setter
+    def episode_length_buf(self, value):
+        self.unwrapped.episode_length_buf = value
+
+    def _split_obs(self, obs_dict, extras=None):
+        if extras is None:
+            extras = {}
+        extras["observations"] = {key: value for key, value in obs_dict.items() if key != "policy"}
+        return obs_dict["policy"], extras
+
+    def reset(self):
+        obs_dict, extras = self.env.reset()
+        return self._split_obs(obs_dict, extras)
+
+    def get_observations(self):
+        if hasattr(self.unwrapped, "observation_manager"):
+            obs_dict = self.unwrapped.observation_manager.compute()
+        else:
+            obs_dict = self.unwrapped._get_observations()
+        return self._split_obs(obs_dict, {})
+
+    def step(self, actions):
+        obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
+        dones = (terminated | truncated).to(dtype=torch.long)
+        if not self.unwrapped.cfg.is_finite_horizon:
+            extras["time_outs"] = truncated
+        obs, extras = self._split_obs(obs_dict, extras)
+        return obs, rew, dones, extras
+
+    def close(self):
+        return self.env.close()
+
 
 def get_motion_files(motion_path: str) -> list[str]:
     """
@@ -92,11 +195,52 @@ def get_motion_files(motion_path: str) -> list[str]:
     else:
         raise ValueError(f"Invalid path: {motion_path}. Must be a file or directory.")
 
+
+def _set_motion_files(env_cfg, motion_files: list[str]) -> None:
+    if not motion_files:
+        return
+    if hasattr(env_cfg.commands.motion, "motion_files"):
+        env_cfg.commands.motion.motion_files = motion_files
+    if hasattr(env_cfg.commands.motion, "motion_file"):
+        env_cfg.commands.motion.motion_file = motion_files[0]
+
+
+def _apply_play_robot_pose_range(env_cfg, pose_range: list[float] | None) -> None:
+    if pose_range is None:
+        return
+    x_range, y_range, yaw_range_deg = [abs(float(value)) for value in pose_range]
+    pose_cfg = dict(getattr(env_cfg.commands.motion, "pose_range", {}) or {})
+    pose_cfg["x"] = (-x_range, x_range)
+    pose_cfg["y"] = (-y_range, y_range)
+    pose_cfg["yaw"] = (-math.radians(yaw_range_deg), math.radians(yaw_range_deg))
+    env_cfg.commands.motion.pose_range = pose_cfg
+    print(
+        "[INFO]: Play robot pose randomization override: "
+        f"x=+/-{x_range:.3f} m, y=+/-{y_range:.3f} m, yaw=+/-{yaw_range_deg:.1f} deg"
+    )
+
+
+def _apply_play_face_goal(env_cfg, enabled: bool, yaw_offset_deg: float) -> None:
+    if not enabled:
+        return
+    env_cfg.commands.motion.align_initial_heading_to_destination = True
+    env_cfg.commands.motion.align_initial_heading_yaw_offset = math.radians(float(yaw_offset_deg))
+    pose_cfg = dict(getattr(env_cfg.commands.motion, "pose_range", {}) or {})
+    pose_cfg["yaw"] = (0.0, 0.0)
+    env_cfg.commands.motion.pose_range = pose_cfg
+    print(
+        "[INFO]: Play face-goal override enabled: robot and ball layout will be yaw-aligned "
+        f"to the target goal with extra yaw offset {float(yaw_offset_deg):.1f} deg"
+    )
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    _apply_play_robot_pose_range(env_cfg, args_cli.play_robot_pose_range)
+    _apply_play_face_goal(env_cfg, args_cli.play_face_goal, args_cli.play_face_goal_yaw_offset_deg)
 
     env_cfg.viewer.origin_type = None
     env_cfg.viewer.asset_name = None
@@ -132,14 +276,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         if args_cli.motion_file is not None:
             print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
-            env_cfg.commands.motion.motion_file = args_cli.motion_file
             motion_files = [args_cli.motion_file]
+            _set_motion_files(env_cfg, motion_files)
 
         art = next((a for a in wandb_run.used_artifacts() if a.type == "motions"), None)
         if art is None:
             print("[WARN] No model artifact found in the run.")
         else:
-            env_cfg.commands.motion.motion_file = str(pathlib.Path(art.download()) / "motion.npz")
+            motion_files = [str(pathlib.Path(art.download()) / "motion.npz")]
+            _set_motion_files(env_cfg, motion_files)
 
     else:
         # Select single-motion or multi-motion mode from CLI args.
@@ -153,7 +298,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             raise ValueError("Either --motion_file or --motion_path must be specified.")
         
-        env_cfg.commands.motion.motion_files = motion_files
+        _set_motion_files(env_cfg, motion_files)
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")

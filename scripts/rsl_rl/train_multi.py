@@ -9,6 +9,12 @@
 
 import argparse
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WHOLE_BODY_TRACKING_SRC = REPO_ROOT / "source" / "whole_body_tracking"
+if str(WHOLE_BODY_TRACKING_SRC) not in sys.path:
+    sys.path.insert(0, str(WHOLE_BODY_TRACKING_SRC))
 
 from isaaclab.app import AppLauncher
 
@@ -24,6 +30,9 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument(
+    "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
+)
 parser.add_argument("--registry_name", type=str, required=False, help="The name of the wand registry.")
 parser.add_argument("--motion_path", type=str, required=True, help="The path to the motion file or directory containing motion files.")
 
@@ -44,11 +53,28 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+# Isaac Lab's URDF converter imports the URDF importer Python module lazily
+# when the robot is spawned.  Some Isaac Sim 4.5 installations do not enable
+# this extension in the default headless experience, so enable it explicitly.
+try:
+    import omni.kit.app
+
+    ext_manager = omni.kit.app.get_app().get_extension_manager()
+    if not ext_manager.is_extension_enabled("isaacsim.asset.importer.urdf"):
+        ext_manager.set_extension_enabled_immediate("isaacsim.asset.importer.urdf", True)
+    from isaacsim.asset.importer.urdf import _urdf
+
+    if not hasattr(_urdf.ImportConfig, "set_merge_fixed_ignore_inertia"):
+        _urdf.ImportConfig.set_merge_fixed_ignore_inertia = _urdf.ImportConfig.set_merge_fixed_joints
+except Exception as exc:
+    print(f"[WARN] Failed to enable isaacsim.asset.importer.urdf extension: {exc}")
+
 """Rest everything follows."""
 
 import gymnasium as gym
 import os
 import glob
+import pickle
 import torch
 from datetime import datetime
 
@@ -60,8 +86,8 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_pickle, dump_yaml
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+from isaaclab.utils.io import dump_yaml
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -73,6 +99,81 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def dump_pickle(filename: str, data):
+    """Dump data to a pickle file.
+
+    Newer Isaac Lab versions removed ``isaaclab.utils.io.dump_pickle`` while
+    keeping ``dump_yaml``.  Keep a local helper for compatibility.
+    """
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with open(filename, "wb") as file:
+        pickle.dump(data, file)
+
+
+class RslRlVecEnvWrapper:
+    """Compatibility wrapper for the TienKung/RSL-RL runner.
+
+    The installed Isaac Lab wrapper returns TensorDict observations for newer
+    rsl-rl versions, while this project uses a runner that expects
+    ``(policy_obs, extras)``.  This wrapper keeps the old tuple API.
+    """
+
+    def __init__(self, env):
+        self.env = env
+        self.num_envs = self.unwrapped.num_envs
+        self.device = self.unwrapped.device
+        self.max_episode_length = self.unwrapped.max_episode_length
+        if hasattr(self.unwrapped, "action_manager"):
+            self.num_actions = self.unwrapped.action_manager.total_action_dim
+        else:
+            self.num_actions = gym.spaces.flatdim(self.unwrapped.single_action_space)
+        self.env.reset()
+
+    @property
+    def cfg(self):
+        return self.unwrapped.cfg
+
+    @property
+    def unwrapped(self):
+        return self.env.unwrapped
+
+    @property
+    def episode_length_buf(self):
+        return self.unwrapped.episode_length_buf
+
+    @episode_length_buf.setter
+    def episode_length_buf(self, value):
+        self.unwrapped.episode_length_buf = value
+
+    def _split_obs(self, obs_dict, extras=None):
+        if extras is None:
+            extras = {}
+        extras["observations"] = {key: value for key, value in obs_dict.items() if key != "policy"}
+        return obs_dict["policy"], extras
+
+    def reset(self):
+        obs_dict, extras = self.env.reset()
+        return self._split_obs(obs_dict, extras)
+
+    def get_observations(self):
+        if hasattr(self.unwrapped, "observation_manager"):
+            obs_dict = self.unwrapped.observation_manager.compute()
+        else:
+            obs_dict = self.unwrapped._get_observations()
+        return self._split_obs(obs_dict, {})
+
+    def step(self, actions):
+        obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
+        dones = (terminated | truncated).to(dtype=torch.long)
+        if not self.unwrapped.cfg.is_finite_horizon:
+            extras["time_outs"] = truncated
+        obs, extras = self._split_obs(obs_dict, extras)
+        return obs, rew, dones, extras
+
+    def close(self):
+        return self.env.close()
 
 
 def get_motion_files(motion_path: str) -> list[str]:
@@ -116,6 +217,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    # multi-gpu training configuration
+    if args_cli.distributed:
+        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
+        agent_cfg.device = f"cuda:{app_launcher.local_rank}"
+
+        # set seed to have diversity in different processes
+        seed = agent_cfg.seed + app_launcher.local_rank
+        env_cfg.seed = seed
+        agent_cfg.seed = seed
 
     motion_files = get_motion_files(args_cli.motion_path)
 

@@ -104,6 +104,19 @@ class KickContactTracker:
         expected_state = self._get_or_init_bool_tensor("expected_kick_success", default=False)
         expected_state[mask] = expected_mask[mask]
 
+    def record_contact_foot(self, env_ids: torch.Tensor, hit_sides: torch.Tensor):
+        """Store the resolved first-contact foot side for episode-level metrics."""
+        if env_ids.numel() == 0:
+            return
+        hit_sides = hit_sides.to(device=self._device, dtype=torch.int8)
+        left_state = self._get_or_init_bool_tensor("actual_left_foot_contact", default=False)
+        right_state = self._get_or_init_bool_tensor("actual_right_foot_contact", default=False)
+        known_state = self._get_or_init_bool_tensor("known_foot_contact", default=False)
+
+        left_state[env_ids] = hit_sides == 0
+        right_state[env_ids] = hit_sides == 1
+        known_state[env_ids] = (hit_sides == 0) | (hit_sides == 1)
+
     def get_contact_awarded(self) -> torch.Tensor:
         """Return kick status: False means not kicked yet, True means kicked."""
         return self._get_or_init_bool_tensor("target_contact_awarded", default=False)
@@ -173,6 +186,9 @@ class KickContactTracker:
         contact_state = self._get_or_init_bool_tensor("target_contact_awarded", default=False)
         kick_success_state = self._get_or_init_bool_tensor("kick_success", default=False)
         expected_state = self._get_or_init_bool_tensor("expected_kick_success", default=False)
+        left_foot_state = self._get_or_init_bool_tensor("actual_left_foot_contact", default=False)
+        right_foot_state = self._get_or_init_bool_tensor("actual_right_foot_contact", default=False)
+        known_foot_state = self._get_or_init_bool_tensor("known_foot_contact", default=False)
 
         # Skip resamples triggered by imminent episode termination to avoid skewed stats.
         eligible_mask = resample_flags.clone()
@@ -199,16 +215,36 @@ class KickContactTracker:
                 command.metrics["expected_kick_success_rate"] = torch.zeros(
                     self._num_envs, device=self._device, dtype=torch.float32
                 )
+            for metric_name in (
+                "actual_left_foot_contact_rate",
+                "actual_right_foot_contact_rate",
+                "correct_foot_episode_rate",
+                "wrong_foot_episode_rate",
+            ):
+                if metric_name not in command.metrics or command.metrics[metric_name].shape[0] != self._num_envs:
+                    command.metrics[metric_name] = torch.zeros(
+                        self._num_envs, device=self._device, dtype=torch.float32
+                    )
 
             if num_eligible > 0:
                 success_rate = kick_success_state[eligible_mask].float().mean()
                 expected_rate = expected_state[eligible_mask].float().mean()
+                left_rate = left_foot_state[eligible_mask].float().mean()
+                right_rate = right_foot_state[eligible_mask].float().mean()
+                wrong_rate = (known_foot_state[eligible_mask] & (~expected_state[eligible_mask])).float().mean()
                 command.metrics["kick_success_rate"].fill_(success_rate.item())
                 command.metrics["expected_kick_success_rate"].fill_(expected_rate.item())
+                command.metrics["actual_left_foot_contact_rate"].fill_(left_rate.item())
+                command.metrics["actual_right_foot_contact_rate"].fill_(right_rate.item())
+                command.metrics["correct_foot_episode_rate"].fill_(expected_rate.item())
+                command.metrics["wrong_foot_episode_rate"].fill_(wrong_rate.item())
 
         contact_state[resample_flags] = False
         kick_success_state[resample_flags] = False
         expected_state[resample_flags] = False
+        left_foot_state[resample_flags] = False
+        right_foot_state[resample_flags] = False
+        known_foot_state[resample_flags] = False
         
         # Reset frozen proximity reward.
         frozen_proximity = self._get_or_init_float_tensor("frozen_proximity_reward", default=0.0)

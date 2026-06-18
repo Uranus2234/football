@@ -1,8 +1,78 @@
+import copy
+
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
 from soccer.assets import ASSET_DIR
+
+G1_BODY_JOINT_NAMES: tuple[str, ...] = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+)
+
+G1_D455_SENSOR_JOINT_NAMES: tuple[str, ...] = ("xl330_joint", "d455_joint")
+G1_D455_SENSOR_HOLD_POS: dict[str, float] = {"xl330_joint": 0.0, "d455_joint": 0.0}
+
+G1_BASE_MOTION_BODY_NAMES: tuple[str, ...] = (
+    "pelvis",
+    "left_hip_pitch_link",
+    "right_hip_pitch_link",
+    "waist_yaw_link",
+    "left_hip_roll_link",
+    "right_hip_roll_link",
+    "waist_roll_link",
+    "left_hip_yaw_link",
+    "right_hip_yaw_link",
+    "torso_link",
+    "left_knee_link",
+    "right_knee_link",
+    "left_shoulder_pitch_link",
+    "right_shoulder_pitch_link",
+    "left_ankle_pitch_link",
+    "right_ankle_pitch_link",
+    "left_shoulder_roll_link",
+    "right_shoulder_roll_link",
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+    "left_shoulder_yaw_link",
+    "right_shoulder_yaw_link",
+    "left_elbow_link",
+    "right_elbow_link",
+    "left_wrist_roll_link",
+    "right_wrist_roll_link",
+    "left_wrist_pitch_link",
+    "right_wrist_pitch_link",
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+)
 
 ARMATURE_5020 = 0.003609725
 ARMATURE_7520_14 = 0.010177520
@@ -179,6 +249,21 @@ G1_CYLINDER_CFG = ArticulationCfg(
             },
         ),
     },
+)
+
+G1_CYLINDER_D455_CFG = copy.deepcopy(G1_CYLINDER_CFG)
+G1_CYLINDER_D455_CFG.spawn.asset_path = f"{ASSET_DIR}/unitree_description/urdf/g1/main_d455.urdf"
+G1_CYLINDER_D455_CFG.spawn.articulation_props = G1_CYLINDER_D455_CFG.spawn.articulation_props.replace(
+    enabled_self_collisions=False
+)
+G1_CYLINDER_D455_CFG.init_state.joint_pos.update(G1_D455_SENSOR_HOLD_POS)
+G1_CYLINDER_D455_CFG.actuators["sensors"] = ImplicitActuatorCfg(
+    joint_names_expr=list(G1_D455_SENSOR_JOINT_NAMES),
+    effort_limit_sim=5.0,
+    velocity_limit_sim=6.0,
+    stiffness=5.0,
+    damping=0.5,
+    armature=0.001,
 )
 
 G1_ACTION_SCALE = {}
