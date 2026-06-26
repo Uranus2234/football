@@ -189,6 +189,23 @@ class KickContactTracker:
         left_foot_state = self._get_or_init_bool_tensor("actual_left_foot_contact", default=False)
         right_foot_state = self._get_or_init_bool_tensor("actual_right_foot_contact", default=False)
         known_foot_state = self._get_or_init_bool_tensor("known_foot_contact", default=False)
+        side_foot_state = self._get_or_init_bool_tensor("side_foot_contact_awarded", default=False)
+        geometric_medial_state = self._get_or_init_bool_tensor("geometric_medial_contact_awarded", default=False)
+        lateral_foot_state = self._get_or_init_bool_tensor("lateral_foot_contact_awarded", default=False)
+        instep_state = self._get_or_init_bool_tensor("instep_contact_awarded", default=False)
+        toe_state = self._get_or_init_bool_tensor("toe_contact_awarded", default=False)
+        expected_side_state = self._get_or_init_bool_tensor("ball_side_expected_contact_awarded", default=False)
+        wrong_side_state = self._get_or_init_bool_tensor("ball_side_wrong_foot_contact_awarded", default=False)
+        support_step_valid_state = self._get_or_init_bool_tensor("support_step_initial_valid", default=False)
+        support_step_completed_state = self._get_or_init_bool_tensor("support_step_completed", default=False)
+        real_goal_success_state = self._get_or_init_bool_tensor("real_goal_success_awarded", default=False)
+        real_goal_miss_state = self._get_or_init_bool_tensor("real_goal_miss_awarded", default=False)
+        real_goal_edge_state = self._get_or_init_bool_tensor("real_goal_edge_hit", default=False)
+        real_goal_lateral_state = self._get_or_init_float_tensor("real_goal_lateral_error", default=0.0)
+        real_goal_speed_state = self._get_or_init_float_tensor("real_goal_cross_speed", default=0.0)
+        real_goal_score_state = self._get_or_init_float_tensor("real_goal_center_score", default=0.0)
+        side_foot_leg_speed_state = self._get_or_init_float_tensor("side_foot_leg_speed", default=0.0)
+        side_foot_leg_speed_reward_state = self._get_or_init_float_tensor("side_foot_leg_speed_reward", default=0.0)
 
         # Skip resamples triggered by imminent episode termination to avoid skewed stats.
         eligible_mask = resample_flags.clone()
@@ -245,6 +262,43 @@ class KickContactTracker:
         left_foot_state[resample_flags] = False
         right_foot_state[resample_flags] = False
         known_foot_state[resample_flags] = False
+        side_foot_state[resample_flags] = False
+        geometric_medial_state[resample_flags] = False
+        lateral_foot_state[resample_flags] = False
+        instep_state[resample_flags] = False
+        toe_state[resample_flags] = False
+        expected_side_state[resample_flags] = False
+        wrong_side_state[resample_flags] = False
+        support_step_valid_state[resample_flags] = False
+        support_step_completed_state[resample_flags] = False
+        real_goal_success_state[resample_flags] = False
+        real_goal_miss_state[resample_flags] = False
+        real_goal_edge_state[resample_flags] = False
+        real_goal_lateral_state[resample_flags] = 0.0
+        real_goal_speed_state[resample_flags] = 0.0
+        real_goal_score_state[resample_flags] = 0.0
+        side_foot_leg_speed_state[resample_flags] = 0.0
+        side_foot_leg_speed_reward_state[resample_flags] = 0.0
+        post_kick_counter = getattr(self._env, self._tensor_name("post_kick_stand_still_counter"), None)
+        if post_kick_counter is not None and post_kick_counter.shape[0] == self._num_envs:
+            post_kick_counter = post_kick_counter.to(device=self._device, dtype=torch.int32)
+            post_kick_counter[resample_flags] = -1
+            setattr(self._env, self._tensor_name("post_kick_stand_still_counter"), post_kick_counter)
+        post_kick_anchor = getattr(self._env, self._tensor_name("post_kick_contact_anchor_xy"), None)
+        if post_kick_anchor is not None and post_kick_anchor.shape == (self._num_envs, 2):
+            post_kick_anchor = post_kick_anchor.to(device=self._device, dtype=torch.float32)
+            post_kick_anchor[resample_flags] = 0.0
+            setattr(self._env, self._tensor_name("post_kick_contact_anchor_xy"), post_kick_anchor)
+        arm_raise_counter = getattr(self._env, self._tensor_name("arm_raise_kick_counter"), None)
+        if arm_raise_counter is not None and arm_raise_counter.shape[0] == self._num_envs:
+            arm_raise_counter = arm_raise_counter.to(device=self._device, dtype=torch.int32)
+            arm_raise_counter[resample_flags] = -1
+            setattr(self._env, self._tensor_name("arm_raise_kick_counter"), arm_raise_counter)
+        support_initial_pos = getattr(self._env, self._tensor_name("support_step_initial_pos"), None)
+        if support_initial_pos is not None and support_initial_pos.shape == (self._num_envs, 3):
+            support_initial_pos = support_initial_pos.to(device=self._device, dtype=torch.float32)
+            support_initial_pos[resample_flags] = 0.0
+            setattr(self._env, self._tensor_name("support_step_initial_pos"), support_initial_pos)
         
         # Reset frozen proximity reward.
         frozen_proximity = self._get_or_init_float_tensor("frozen_proximity_reward", default=0.0)
@@ -258,7 +312,16 @@ class KickContactTracker:
 
     def _reset_reward_timers(self, resample_flags: torch.Tensor):
         """Reset reward timer states for environments that have been resampled."""
-        timer_suffixes = ["dir_align_timer", "dir_align_prev", "speed_timer", "speed_prev", "z_speed_timer", "z_speed_prev"]
+        timer_suffixes = [
+            "dir_align_timer",
+            "dir_align_prev",
+            "speed_timer",
+            "speed_prev",
+            "autonomous_speed_timer",
+            "style_gated_speed_timer",
+            "z_speed_timer",
+            "z_speed_prev",
+        ]
         for suffix in timer_suffixes:
             timer_name = f"_{self._state_prefix}_{suffix}"
             timer = getattr(self._env, timer_name, None)

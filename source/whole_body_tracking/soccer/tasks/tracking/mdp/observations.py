@@ -90,6 +90,12 @@ def motion_anchor_ang_vel(env: ManagerBasedEnv, command_name: str) -> torch.Tens
     return command.anchor_ang_vel_w.view(env.num_envs, -1)
 
 
+def motion_joint_vel(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+
+    return command.joint_vel.view(env.num_envs, -1)
+
+
 def _get_motion_command(env: ManagerBasedEnv, command_name: str) -> MotionCommand:
     command: MotionCommand | None = env.command_manager.get_term(command_name)
     if command is None:
@@ -406,6 +412,18 @@ def near_field_latched_ball_observation(env: ManagerBasedEnv, command_name: str 
         ],
         dim=-1,
     )
+
+
+def kick_elapsed_phase(env: ManagerBasedEnv, command_name: str = "motion") -> torch.Tensor:
+    """Return normalized kick elapsed time as a deployable phase scalar.
+
+    Unlike ``generated_commands`` this does not expose any reference motion
+    state.  Deployment can reproduce it with ``policy_step / max_steps``.
+    """
+    command = _get_motion_command(env, command_name)
+    dtype = command.target_point_pos.dtype
+    phase = command.time_steps.to(dtype=dtype) / (command.motion_length.to(dtype=dtype).clamp(min=2.0) - 1.0)
+    return phase.clamp(0.0, 1.0).unsqueeze(-1)
 
 
 def hold_target_destination_pos_local(env: ManagerBasedEnv, command_name: str = "motion") -> torch.Tensor:

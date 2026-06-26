@@ -29,6 +29,71 @@ def export_motion_policy_as_onnx(
     policy_exporter.export(path, filename)
 
 
+def export_student_policy_as_onnx(
+    env: ManagerBasedRLEnv,
+    actor_critic: object,
+    path: str,
+    normalizer: object | None = None,
+    filename="policy.onnx",
+    verbose=False,
+):
+    """Export deploy-native policy without embedded motion reference tensors."""
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+    policy_exporter = _OnnxStudentPolicyExporter(actor_critic, normalizer, verbose)
+    policy_exporter.export(path, filename)
+
+
+class _OnnxStudentPolicyExporter(_OnnxPolicyExporter):
+    def forward_lstm(self, x_in, h_in, c_in):
+        x_in = self.normalizer(x_in)
+        x, (h, c) = self.rnn(x_in.unsqueeze(0), (h_in, c_in))
+        x = x.squeeze(0)
+        return self.actor(x), h, c
+
+    def export(self, path, filename):
+        self.to("cpu")
+        self.eval()
+
+        if self.is_recurrent and hasattr(self, "rnn"):
+            class _LstmExportWrapper(torch.nn.Module):
+                def __init__(self, parent):
+                    super().__init__()
+                    self.parent = parent
+
+                def forward(self, obs, h_in, c_in):
+                    return self.parent.forward_lstm(obs, h_in, c_in)
+
+            wrapper = _LstmExportWrapper(self)
+            obs = torch.zeros(1, self.rnn.input_size)
+            h_in = torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
+            c_in = torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
+            torch.onnx.export(
+                wrapper,
+                (obs, h_in, c_in),
+                os.path.join(path, filename),
+                export_params=True,
+                opset_version=11,
+                verbose=self.verbose,
+                input_names=["obs", "h_in", "c_in"],
+                output_names=["actions", "h_out", "c_out"],
+                dynamic_axes={},
+            )
+        else:
+            obs = torch.zeros(1, self.actor[0].in_features)
+            torch.onnx.export(
+                self,
+                obs,
+                os.path.join(path, filename),
+                export_params=True,
+                opset_version=11,
+                verbose=self.verbose,
+                input_names=["obs"],
+                output_names=["actions"],
+                dynamic_axes={},
+            )
+
+
 class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
     def __init__(self, env: ManagerBasedRLEnv, actor_critic, normalizer=None, verbose=False, motion_name=None):
         super().__init__(actor_critic, normalizer, verbose)
@@ -90,7 +155,7 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
         self.to("cpu")
         self.eval()
 
-        if self.is_recurrent and getattr(self, "rnn_type", "").lower() == "lstm":
+        if self.is_recurrent and hasattr(self, "rnn"):
             class _LstmExportWrapper(torch.nn.Module):
                 def __init__(self, parent):
                     super().__init__()

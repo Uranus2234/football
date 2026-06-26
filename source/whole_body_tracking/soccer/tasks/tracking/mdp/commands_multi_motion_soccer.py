@@ -285,6 +285,8 @@ class MotionCommand(CommandTerm):
         self.metrics["goal_init_ball_base_x"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["goal_init_ball_base_y"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["goal_init_yaw_error_abs"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["motion_ball_bucket_enabled"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["motion_ball_bucket_index"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["expected_left_foot_rate"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["expected_right_foot_rate"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sim2real_perception_latency_steps"] = torch.zeros(self.num_envs, device=self.device)
@@ -551,6 +553,52 @@ class MotionCommand(CommandTerm):
             return torch.full(shape, low, dtype=torch.float32, device=self.device)
         return low + torch.rand(shape, dtype=torch.float32, device=self.device) * (high - low)
 
+    def _sample_motion_ball_bucket_base_xy(
+        self,
+        ids: torch.Tensor,
+        default_x_range: tuple[float, float],
+        default_y_range: tuple[float, float],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample base-frame ball xy from the bucket assigned to each selected motion."""
+        ranges = getattr(self.cfg, "motion_ball_bucket_base_xy_ranges", None)
+        enabled = bool(getattr(self.cfg, "enable_motion_ball_bucket_sampling", False)) and ranges is not None
+        fallback = bool(getattr(self.cfg, "motion_ball_bucket_fallback_to_goal_aware", True))
+        if not enabled:
+            return (
+                self._sample_uniform_range(default_x_range, (ids.numel(),)),
+                self._sample_uniform_range(default_y_range, (ids.numel(),)),
+                torch.full((ids.numel(),), -1, dtype=torch.long, device=self.device),
+            )
+
+        if len(ranges) != int(self.motion.num_files):
+            if not fallback:
+                raise RuntimeError(
+                    "MotionCommandCfg.motion_ball_bucket_base_xy_ranges must have one entry per motion file "
+                    f"({len(ranges)} ranges for {int(self.motion.num_files)} files)."
+                )
+            return (
+                self._sample_uniform_range(default_x_range, (ids.numel(),)),
+                self._sample_uniform_range(default_y_range, (ids.numel(),)),
+                torch.full((ids.numel(),), -1, dtype=torch.long, device=self.device),
+            )
+
+        motion_indices = self.motion_idx[ids].to(dtype=torch.long)
+        ball_x = torch.empty(ids.numel(), dtype=torch.float32, device=self.device)
+        ball_y = torch.empty_like(ball_x)
+        for motion_i in torch.unique(motion_indices).tolist():
+            motion_i = int(motion_i)
+            mask = motion_indices == motion_i
+            bucket = ranges[motion_i]
+            if isinstance(bucket, dict):
+                x_range = bucket.get("x", default_x_range)
+                y_range = bucket.get("y", default_y_range)
+            else:
+                x_range, y_range = bucket
+            count = int(mask.sum().item())
+            ball_x[mask] = self._sample_uniform_range((float(x_range[0]), float(x_range[1])), (count,))
+            ball_y[mask] = self._sample_uniform_range((float(y_range[0]), float(y_range[1])), (count,))
+        return ball_x, ball_y, motion_indices
+
     def _sample_goal_aware_initial_layout(self, env_ids: Sequence[int] | torch.Tensor):
         ids = self._to_env_id_tensor(env_ids)
         if ids.numel() == 0:
@@ -588,16 +636,22 @@ class MotionCommand(CommandTerm):
         root_yaw = torch.atan2(root_forward[:, 1], root_forward[:, 0])
         self.initial_heading_yaw_delta[ids] = robot_yaw - root_yaw
 
-        ball_base_x = self._sample_uniform_range(ball_x_range, (ids.numel(),))
-        if bool(getattr(self.cfg, "goal_aware_ball_lateral_by_kick_leg", False)):
+        bucket_ball_x, bucket_ball_y, bucket_index = self._sample_motion_ball_bucket_base_xy(
+            ids, ball_x_range, ball_y_range
+        )
+        bucket_enabled = bucket_index >= 0
+        ball_base_x = bucket_ball_x
+        has_bucket_fallback = not bool(torch.all(bucket_enabled).item())
+        if bool(getattr(self.cfg, "goal_aware_ball_lateral_by_kick_leg", False)) and has_bucket_fallback:
             ball_y_abs = self._sample_uniform_range(ball_y_abs_range, (ids.numel(),))
             kick_leg = self.motion_kick_leg[self.motion_idx[ids]]
             y_sign = torch.where(kick_leg == 0, torch.ones_like(ball_y_abs), -torch.ones_like(ball_y_abs))
             known_leg = (kick_leg == 0) | (kick_leg == 1)
             random_y = self._sample_uniform_range(ball_y_range, (ids.numel(),))
-            ball_base_y = torch.where(known_leg, y_sign * ball_y_abs, random_y)
+            fallback_y = torch.where(known_leg, y_sign * ball_y_abs, random_y)
+            ball_base_y = torch.where(bucket_enabled, bucket_ball_y, fallback_y)
         else:
-            ball_base_y = self._sample_uniform_range(ball_y_range, (ids.numel(),))
+            ball_base_y = bucket_ball_y
         c = torch.cos(robot_yaw)
         s = torch.sin(robot_yaw)
         ball_xy = robot_xy + torch.stack(
@@ -626,6 +680,8 @@ class MotionCommand(CommandTerm):
         self.metrics["goal_init_ball_base_x"][ids] = ball_base_x
         self.metrics["goal_init_ball_base_y"][ids] = ball_base_y
         self.metrics["goal_init_yaw_error_abs"][ids] = torch.abs(yaw_error)
+        self.metrics["motion_ball_bucket_enabled"][ids] = bucket_enabled.to(torch.float32)
+        self.metrics["motion_ball_bucket_index"][ids] = bucket_index.to(torch.float32)
         expected_leg = self.motion_kick_leg[self.motion_idx[ids]]
         self.metrics["expected_left_foot_rate"][ids] = (expected_leg == 0).to(torch.float32)
         self.metrics["expected_right_foot_rate"][ids] = (expected_leg == 1).to(torch.float32)
@@ -1359,6 +1415,9 @@ class MotionCommandCfg(CommandTermCfg):
         (0.04, 0.25),
         (0.02, 0.32),
     )
+    enable_motion_ball_bucket_sampling: bool = False
+    motion_ball_bucket_base_xy_ranges: list | None = None
+    motion_ball_bucket_fallback_to_goal_aware: bool = True
 
     # Destination/goal sampling in field coordinates.  Soccer_Lab/Firmware use
     # field center as origin, long axis as x, and goal centers at x=+/-length/2.

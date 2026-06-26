@@ -28,6 +28,13 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
 parser.add_argument(
+    "--motion_path",
+    type=str,
+    default=None,
+    help="Path to a directory containing motion .npz files. If omitted for V4, motions/soccer-standard is used.",
+)
+parser.add_argument("--export_student_policy", action="store_true", default=False, help="Export deploy-native policy without embedded motion reference tensors.")
+parser.add_argument(
     "--play_robot_pose_range",
     type=float,
     nargs=3,
@@ -46,6 +53,24 @@ parser.add_argument(
     type=float,
     default=0.0,
     help="Extra yaw offset in degrees applied after --play_face_goal alignment.",
+)
+parser.add_argument(
+    "--play_goal_init_stage",
+    type=int,
+    default=None,
+    help="Play-only goal-aware init stage override. Use 3 for final-stage ranges and real goal gate.",
+)
+parser.add_argument(
+    "--play_midfield_kick",
+    action="store_true",
+    default=False,
+    help="Play-only reset override for midfield/mid-range shots instead of near-goal Stage-A starts.",
+)
+parser.add_argument(
+    "--play_follow_robot_camera",
+    action="store_true",
+    default=False,
+    help="Keep the viewer camera attached to the robot during play video capture.",
 )
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -66,6 +91,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import glob
 import os
 import pathlib
 import torch
@@ -86,7 +112,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
-from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx, export_student_policy_as_onnx
 
 
 class RslRlVecEnvWrapper:
@@ -157,6 +183,43 @@ def _set_motion_file(env_cfg, motion_file: str | None) -> None:
         env_cfg.commands.motion.motion_file = motion_file
 
 
+def _motion_files_from_path(motion_path: str) -> list[str]:
+    path = pathlib.Path(motion_path)
+    if path.is_file():
+        return [str(path)]
+    if path.is_dir():
+        motion_files = sorted(glob.glob(str(path / "*.npz")))
+        if motion_files:
+            return motion_files
+    raise ValueError(f"No motion .npz files found at: {motion_path}")
+
+
+def _set_motion_files(env_cfg, motion_files: list[str]) -> None:
+    if not motion_files:
+        return
+    if hasattr(env_cfg.commands.motion, "motion_files"):
+        env_cfg.commands.motion.motion_files = motion_files
+    if hasattr(env_cfg.commands.motion, "motion_file"):
+        env_cfg.commands.motion.motion_file = motion_files[0]
+
+
+def _set_motion_from_cli_or_v4_default(env_cfg, args_cli) -> None:
+    if args_cli.motion_file is not None:
+        print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
+        _set_motion_file(env_cfg, args_cli.motion_file)
+        return
+    if args_cli.motion_path is not None:
+        motion_files = _motion_files_from_path(args_cli.motion_path)
+        print(f"[INFO]: Using {len(motion_files)} motion files from CLI path: {args_cli.motion_path}")
+        _set_motion_files(env_cfg, motion_files)
+        return
+    if args_cli.task is not None and "NearFieldGoalKickV4" in args_cli.task:
+        default_motion_path = REPO_ROOT / "motions" / "soccer-standard"
+        motion_files = _motion_files_from_path(str(default_motion_path))
+        print(f"[INFO]: V4 play default motion path: {default_motion_path} ({len(motion_files)} files)")
+        _set_motion_files(env_cfg, motion_files)
+
+
 def _apply_play_robot_pose_range(env_cfg, pose_range: list[float] | None) -> None:
     if pose_range is None:
         return
@@ -175,8 +238,11 @@ def _apply_play_robot_pose_range(env_cfg, pose_range: list[float] | None) -> Non
 def _apply_play_face_goal(env_cfg, enabled: bool, yaw_offset_deg: float) -> None:
     if not enabled:
         return
+    yaw_offset = math.radians(float(yaw_offset_deg))
     env_cfg.commands.motion.align_initial_heading_to_destination = True
-    env_cfg.commands.motion.align_initial_heading_yaw_offset = math.radians(float(yaw_offset_deg))
+    env_cfg.commands.motion.align_initial_heading_yaw_offset = yaw_offset
+    if hasattr(env_cfg.commands.motion, "goal_aware_yaw_error_ranges"):
+        env_cfg.commands.motion.goal_aware_yaw_error_ranges = ((yaw_offset, yaw_offset),) * 3
     pose_cfg = dict(getattr(env_cfg.commands.motion, "pose_range", {}) or {})
     pose_cfg["yaw"] = (0.0, 0.0)
     env_cfg.commands.motion.pose_range = pose_cfg
@@ -186,6 +252,48 @@ def _apply_play_face_goal(env_cfg, enabled: bool, yaw_offset_deg: float) -> None
     )
 
 
+def _repeat_goal_range(value_range):
+    return (tuple(value_range), tuple(value_range), tuple(value_range))
+
+
+def _apply_play_goal_init_stage(env_cfg, stage: int | None) -> None:
+    if stage is None:
+        return
+    stage_value = int(stage)
+    source_idx = 0 if stage_value <= 0 else 1 if stage_value == 1 else 2
+    motion_cfg = env_cfg.commands.motion
+    for name in (
+        "goal_aware_robot_x_ranges",
+        "goal_aware_robot_y_ranges",
+        "goal_aware_yaw_error_ranges",
+        "goal_aware_ball_x_front_ranges",
+        "goal_aware_ball_y_lat_ranges",
+        "goal_aware_ball_y_lat_abs_ranges",
+    ):
+        if hasattr(motion_cfg, name):
+            ranges = getattr(motion_cfg, name)
+            if len(ranges) >= 3:
+                setattr(motion_cfg, name, _repeat_goal_range(ranges[source_idx]))
+    if stage_value >= 3:
+        motion_cfg.goal_aware_curriculum_steps = (-3, -2, -1)
+        motion_cfg.goal_gate_curriculum_steps = (-3, -2, -1)
+    print(f"[INFO]: Play goal-aware init stage override: stage={stage_value}, source_range_index={source_idx}")
+
+
+def _apply_play_midfield_kick(env_cfg, enabled: bool) -> None:
+    if not enabled:
+        return
+    motion_cfg = env_cfg.commands.motion
+    motion_cfg.goal_aware_robot_x_ranges = ((0.5, 3.2),) * 3
+    motion_cfg.goal_aware_robot_y_ranges = ((-2.8, 2.8),) * 3
+    motion_cfg.goal_aware_ball_x_front_ranges = ((0.55, 1.05),) * 3
+    motion_cfg.goal_aware_ball_y_lat_ranges = ((-0.35, 0.35),) * 3
+    motion_cfg.goal_aware_ball_y_lat_abs_ranges = ((0.06, 0.30),) * 3
+    motion_cfg.goal_aware_curriculum_steps = (-3, -2, -1)
+    motion_cfg.goal_gate_curriculum_steps = (-3, -2, -1)
+    print("[INFO]: Play midfield kick override enabled: robot x=[0.5,3.2], real goal gate forced.")
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
@@ -193,9 +301,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     _apply_play_robot_pose_range(env_cfg, args_cli.play_robot_pose_range)
     _apply_play_face_goal(env_cfg, args_cli.play_face_goal, args_cli.play_face_goal_yaw_offset_deg)
+    _apply_play_goal_init_stage(env_cfg, args_cli.play_goal_init_stage)
+    _apply_play_midfield_kick(env_cfg, args_cli.play_midfield_kick)
 
-    env_cfg.viewer.origin_type = None
-    env_cfg.viewer.asset_name = None
+    if args_cli.play_follow_robot_camera:
+        env_cfg.viewer.origin_type = "asset_root"
+        env_cfg.viewer.asset_name = "robot"
+        env_cfg.viewer.eye = (2.0, 2.0, 1.2)
+    else:
+        env_cfg.viewer.origin_type = None
+        env_cfg.viewer.asset_name = None
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
@@ -223,9 +338,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {run_path}/{file}")
         resume_path = f"./logs/rsl_rl/temp/{file}"
 
-        if args_cli.motion_file is not None:
-            print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
-            _set_motion_file(env_cfg, args_cli.motion_file)
+        _set_motion_from_cli_or_v4_default(env_cfg, args_cli)
 
         art = next((a for a in wandb_run.used_artifacts() if a.type == "motions"), None)
         if art is None:
@@ -234,7 +347,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _set_motion_file(env_cfg, str(pathlib.Path(art.download()) / "motion.npz"))
 
     else:
-        _set_motion_file(env_cfg, args_cli.motion_file)
+        _set_motion_from_cli_or_v4_default(env_cfg, args_cli)
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
@@ -275,17 +388,47 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
     
     ckpt = args_cli.checkpoint.split('_')[1].split('.')[0]
-    filename = f"policy_{ckpt}.onnx"
-    export_motion_name = os.path.basename(args_cli.motion_file) if args_cli.motion_file is not None else None
-    export_motion_policy_as_onnx(
-        env.unwrapped,
-        ppo_runner.alg.policy,
-        normalizer=ppo_runner.obs_normalizer,
-        path=export_model_dir,
-        filename=filename,
-        motion_name=export_motion_name,
-    )
-    attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir, filename=filename)
+    task_name = str(args_cli.task)
+    export_student = args_cli.export_student_policy or ("NearFieldGoalKickV4" in task_name and "Teacher" not in task_name)
+    exported_filename = None
+    if export_student:
+        filename = f"policy_{ckpt}_student.onnx"
+        export_student_policy_as_onnx(
+            env.unwrapped,
+            ppo_runner.alg.policy,
+            normalizer=ppo_runner.obs_normalizer,
+            path=export_model_dir,
+            filename=filename,
+        )
+        exported_filename = filename
+    else:
+        export_motion_name = None
+        if args_cli.motion_file is not None:
+            export_motion_name = os.path.basename(args_cli.motion_file)
+        elif args_cli.motion_path is not None and pathlib.Path(args_cli.motion_path).is_file():
+            export_motion_name = os.path.basename(args_cli.motion_path)
+
+        if export_motion_name is None and "Teacher" in task_name:
+            print("[INFO]: Skipping teacher motion ONNX export for multi-motion play. "
+                  "Use --motion_file <motion.npz> if you need a motion-embedded teacher export.")
+        else:
+            filename = f"policy_{ckpt}.onnx"
+            export_motion_policy_as_onnx(
+                env.unwrapped,
+                ppo_runner.alg.policy,
+                normalizer=ppo_runner.obs_normalizer,
+                path=export_model_dir,
+                filename=filename,
+                motion_name=export_motion_name,
+            )
+            exported_filename = filename
+    if exported_filename is not None:
+        attach_onnx_metadata(
+            env.unwrapped,
+            args_cli.wandb_path if args_cli.wandb_path else "none",
+            export_model_dir,
+            filename=exported_filename,
+        )
     # reset environment
     # breakpoint()
     obs, _ = env.get_observations()

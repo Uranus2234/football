@@ -18,6 +18,8 @@
 # !.vscode
 
 # Outputs
+build/
+nohup.out
 **/runs/*
 **/logs/*
 **/recordings/*

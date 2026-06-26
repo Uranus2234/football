@@ -1,3 +1,4 @@
+import copy
 import math
 
 import isaaclab.sim as sim_utils
@@ -8,6 +9,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.sensors import CameraCfg, ContactSensorCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.markers import VisualizationMarkersCfg
 
 from soccer.assets.soccer_lab import (
@@ -49,6 +51,18 @@ SOCCER_FIELD_WIDTH = SOCCER_LAB_FIELD.field_width
 SOCCER_GOAL_WIDTH = SOCCER_LAB_FIELD.goal_width
 SOCCER_GOAL_HALF_WIDTH = SOCCER_GOAL_WIDTH * 0.5
 SOCCER_LAB_BALL_RIGID_BODY_PRIM = "Ball_obj_cleaner_materialmerger_gles"
+SOCCER_STANDARD_10_BALL_BUCKETS = [
+    {"x": (0.35, 0.55), "y": (-0.18, -0.08)},
+    {"x": (0.35, 0.55), "y": (0.08, 0.18)},
+    {"x": (0.50, 0.70), "y": (0.08, 0.20)},
+    {"x": (0.50, 0.70), "y": (-0.20, -0.08)},
+    {"x": (0.65, 0.85), "y": (-0.24, -0.10)},
+    {"x": (0.80, 0.95), "y": (-0.30, -0.14)},
+    {"x": (0.65, 0.85), "y": (0.10, 0.24)},
+    {"x": (0.80, 0.95), "y": (0.14, 0.30)},
+    {"x": (0.45, 0.80), "y": (-0.08, 0.02)},
+    {"x": (0.55, 0.95), "y": (-0.12, 0.06)},
+]
 
 
 def _make_delayed_actuator_cfg(actuator_cfg, min_delay: int = 0, max_delay: int = 3) -> DelayedImplicitActuatorCfg:
@@ -199,6 +213,44 @@ def _apply_g1_motion_body_indexes(cfg):
     cfg.commands.motion.motion_body_indexes = [
         G1_BASE_MOTION_BODY_NAMES.index(body_name) for body_name in cfg.commands.motion.body_names
     ]
+
+
+def _apply_beyondmimic_teacher_policy_obs(cfg) -> None:
+    """Restore reference-conditioned teacher inputs while keeping V4 sim2real noise."""
+    cfg.observations.policy.command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
+    cfg.observations.policy.motion_ref_joint_vel = ObsTerm(
+        func=mdp.motion_joint_vel,
+        params={"command_name": "motion"},
+        noise=Unoise(n_min=-0.5, n_max=0.5),
+    )
+    cfg.observations.policy.motion_anchor_pos_b = ObsTerm(
+        func=mdp.motion_anchor_pos_b,
+        params={"command_name": "motion"},
+        noise=Unoise(n_min=-0.25, n_max=0.25),
+    )
+    cfg.observations.policy.motion_anchor_ori_b = ObsTerm(
+        func=mdp.motion_anchor_ori_b,
+        params={"command_name": "motion"},
+        noise=Unoise(n_min=-0.05, n_max=0.05),
+    )
+    cfg.observations.policy.motion_ref_ang_vel = ObsTerm(
+        func=mdp.motion_anchor_ang_vel,
+        params={"command_name": "motion"},
+        noise=Unoise(n_min=-0.05, n_max=0.05),
+    )
+    cfg.observations.policy.base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.5, n_max=0.5))
+
+
+def _make_beyondmimic_student_policy_obs(teacher_obs):
+    student_obs = copy.deepcopy(teacher_obs)
+    student_obs.command = None
+    student_obs.motion_ref_joint_vel = None
+    student_obs.motion_anchor_pos_b = None
+    student_obs.motion_anchor_ori_b = None
+    student_obs.motion_ref_ang_vel = None
+    student_obs.base_lin_vel = None
+    student_obs.kick_elapsed_phase = ObsTerm(func=mdp.kick_elapsed_phase, params={"command_name": "motion"})
+    return student_obs
 
 
 ## Scene configuration
@@ -918,6 +970,1038 @@ class G1FlatNearFieldGoalKickV3EnvCfg(G1FlatNearFieldGoalKickV2EnvCfg):
         self.rewards.ball_velocity_to_goal.weight = 8.0
         self.rewards.ball_speed_reward.weight = 6.0
         self.rewards.ball_forward_progress.weight = 6.0
+
+
+@configclass
+class G1FlatNearFieldGoalKickV4StudentEnvCfg(G1FlatNearFieldGoalKickV3EnvCfg):
+    """Deploy-native student kicker: actor sees proprioception, ball, direction, and phase only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Remove motion-conditioned actor inputs.  The critic/rewards still use
+        # the motion command as an asymmetric training prior, but deployment no
+        # longer has to choose or embed a reference motion.
+        self.observations.policy.command = None
+        self.observations.policy.motion_ref_ang_vel = None
+        self.observations.policy.kick_elapsed_phase = ObsTerm(
+            func=mdp.kick_elapsed_phase,
+            params={"command_name": "motion"},
+        )
+
+        # V4 must not reward matching a hidden selected kick leg.  Any valid
+        # first foot contact can receive the base contact reward; inside/toe
+        # shaping is computed from the actual contacting foot.
+        self.rewards.target_point_contact = RewTerm(
+            func=mdp.autonomous_target_point_contact,
+            weight=10.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "foot_cfg": self.foot_cfg,
+            },
+        )
+        self.rewards.sideways_kick.weight = 0.0
+        self.rewards.wrong_foot_contact_penalty.weight = 0.0
+        self.rewards.inside_foot_contact = RewTerm(
+            func=mdp.autonomous_inside_foot_contact_reward,
+            weight=25.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "foot_cfg": self.foot_cfg,
+            },
+        )
+        self.rewards.toe_contact_penalty = RewTerm(
+            func=mdp.autonomous_toe_contact_penalty,
+            weight=-25.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "foot_cfg": self.foot_cfg,
+            },
+        )
+
+
+@configclass
+class G1FlatNearFieldGoalKickV4LitePowerEnvCfg(G1FlatNearFieldGoalKickV4StudentEnvCfg):
+    """From-scratch V4 student kicker with compact style rewards and mild extra ball speed."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.motion.goal_aware_ball_lateral_by_kick_leg = False
+        self.commands.motion.goal_aware_ball_y_lat_ranges = (
+            (-0.18, 0.18),
+            (-0.26, 0.26),
+            (-0.35, 0.35),
+        )
+        self.commands.motion.goal_aware_ball_x_front_ranges = (
+            (0.35, 0.65),
+            (0.45, 0.80),
+            (0.55, 0.90),
+        )
+
+        # Replace the many overlapping motion priors with one compact style
+        # term.  Keep basic regularizers and termination penalties inherited
+        # from earlier tasks.
+        self.rewards.motion_global_anchor_pos.weight = 0.0
+        self.rewards.motion_global_anchor_ori.weight = 0.0
+        self.rewards.motion_body_pos.weight = 0.0
+        self.rewards.motion_body_ori.weight = 0.0
+        self.rewards.motion_body_lin_vel.weight = 0.0
+        self.rewards.motion_body_ang_vel.weight = 0.0
+        self.rewards.motion_foot_pos.weight = 0.0
+        self.rewards.goal_aware_root_trajectory.weight = 0.0
+        self.rewards.pre_contact_motion_style_lite = RewTerm(
+            func=mdp.pre_contact_motion_style_lite,
+            weight=6.0,
+            params={
+                "command_name": "motion",
+                "root_std": 0.35,
+                "foot_std": 0.24,
+                "torso_pitch_threshold": 0.18,
+                "torso_pitch_scale": 0.24,
+                "post_contact_scale": 0.08,
+            },
+        )
+
+        contact_params = {
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "horizontal_force_threshold": 10,
+            "foot_cfg": self.foot_cfg,
+            "center_deadband": 0.08,
+        }
+        self.rewards.target_point_contact = RewTerm(
+            func=mdp.ball_side_expected_target_point_contact,
+            weight=5.0,
+            params=contact_params,
+        )
+        self.rewards.inside_foot_contact = RewTerm(
+            func=mdp.autonomous_side_foot_contact_reward,
+            weight=80.0,
+            params={
+                **contact_params,
+                "inside_y_range": (0.035, 0.145),
+                "side_x_range": (-0.08, 0.11),
+                "z_abs_max": 0.16,
+                "side_y_target": 0.085,
+                "side_y_std": 0.045,
+            },
+        )
+        self.rewards.toe_contact_penalty = RewTerm(
+            func=mdp.side_foot_toe_contact_penalty,
+            weight=-35.0,
+            params={
+                **contact_params,
+                "toe_x_min": 0.12,
+                "toe_y_abs_max": 0.075,
+            },
+        )
+        self.rewards.instep_contact_penalty = RewTerm(
+            func=mdp.side_foot_instep_contact_penalty,
+            weight=-30.0,
+            params={
+                **contact_params,
+                "instep_x_range": (-0.05, 0.15),
+                "instep_y_abs_max": 0.045,
+            },
+        )
+        self.rewards.wrong_side_foot_contact_penalty = RewTerm(
+            func=mdp.ball_side_wrong_foot_contact_penalty,
+            weight=-10.0,
+            params=contact_params,
+        )
+        self.rewards.sideways_kick.weight = 0.0
+        self.rewards.wrong_foot_contact_penalty.weight = 0.0
+
+        self.rewards.goal_gate_success.weight = 0.0
+        self.rewards.goal_gate_miss.weight = -40.0
+        self.rewards.goal_gate_center_success = RewTerm(
+            func=mdp.side_foot_goal_gate_center_success,
+            weight=240.0,
+            params={
+                "command_name": "motion",
+                "non_side_scale": 0.15,
+            },
+        )
+        self.rewards.goal_cross_speed_reward = RewTerm(
+            func=mdp.side_foot_goal_cross_speed_reward,
+            weight=45.0,
+            params={
+                "command_name": "motion",
+                "speed_scale": 3.0,
+                "non_side_scale": 0.15,
+            },
+        )
+
+        self.rewards.ball_velocity_direction_alignment.weight = 6.0
+        self.rewards.ball_speed_reward.weight = 0.0
+        self.rewards.ball_forward_progress.weight = 4.0
+        self.rewards.ball_velocity_to_goal.weight = 7.5
+        self.rewards.ball_lateral_corridor_penalty.weight = -8.0
+        self.rewards.ball_wrong_way_penalty.weight = -8.0
+        self.rewards.side_foot_ball_speed_lite = RewTerm(
+            func=mdp.side_foot_ball_speed_lite_reward,
+            weight=2.0,
+            params={
+                "command_name": "motion",
+                "std": 2.4,
+                "velocity_threshold": 0.15,
+            },
+        )
+
+        self.rewards.far_ball_pre_contact_approach = RewTerm(
+            func=mdp.far_ball_pre_contact_approach_reward,
+            weight=3.0,
+            params={
+                "command_name": "motion",
+                "far_ball_x": 0.75,
+                "progress_scale": 0.18,
+            },
+        )
+        self.rewards.far_ball_early_contact_penalty = RewTerm(
+            func=mdp.far_ball_early_contact_penalty,
+            weight=-20.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "far_ball_x": 0.75,
+                "min_root_progress": 0.10,
+            },
+        )
+        self.rewards.pre_contact_double_air_penalty.weight = -2.0
+        self.rewards.torso_pitch_penalty = RewTerm(
+            func=mdp.torso_pitch_penalty,
+            weight=-8.0,
+            params={
+                "command_name": "motion",
+                "body_name": "torso_link",
+                "pitch_threshold": 0.20,
+                "pitch_scale": 0.30,
+                "far_ball_x": 0.75,
+                "far_extra_scale": 1.0,
+            },
+        )
+        self.rewards.post_kick_stand_still = RewTerm(
+            func=mdp.post_kick_stand_still,
+            weight=10.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "foot_cfg": self.foot_cfg,
+                "delay_s": 0.5,
+            },
+        )
+        self.rewards.post_kick_drift_penalty = RewTerm(
+            func=mdp.post_kick_drift_penalty,
+            weight=-6.0,
+            params={
+                "command_name": "motion",
+                "delay_s": 0.5,
+                "drift_limit": 0.18,
+                "drift_scale": 0.30,
+            },
+        )
+
+
+@configclass
+class G1FlatNearFieldGoalKickV4InsideStandEnvCfg(G1FlatNearFieldGoalKickV4LitePowerEnvCfg):
+    """From-scratch LitePower variant with corrected medial contact and cleaner finish posture."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Keep the 101-dim deploy-native actor observation from V4Student/LitePower.
+        # The only contact-protocol change is the corrected medial sign: right-foot
+        # medial is toward robot centerline, left-foot medial is symmetric.
+        contact_params = {
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "horizontal_force_threshold": 10,
+            "foot_cfg": self.foot_cfg,
+            "center_deadband": 0.08,
+            "medial_sign_left": 1.0,
+            "medial_sign_right": -1.0,
+        }
+        self.rewards.target_point_contact = RewTerm(
+            func=mdp.ball_side_expected_target_point_contact,
+            weight=4.0,
+            params=contact_params,
+        )
+        self.rewards.inside_foot_contact = RewTerm(
+            func=mdp.autonomous_side_foot_contact_reward,
+            weight=105.0,
+            params={
+                **contact_params,
+                "inside_y_range": (0.035, 0.145),
+                "side_x_range": (-0.08, 0.11),
+                "z_abs_max": 0.16,
+                "side_y_target": 0.085,
+                "side_y_std": 0.045,
+            },
+        )
+        self.rewards.lateral_foot_contact_penalty = RewTerm(
+            func=mdp.lateral_side_foot_contact_penalty,
+            weight=-45.0,
+            params={
+                **contact_params,
+                "inside_y_range": (0.035, 0.145),
+                "side_x_range": (-0.08, 0.11),
+                "z_abs_max": 0.16,
+            },
+        )
+        self.rewards.toe_contact_penalty = RewTerm(
+            func=mdp.side_foot_toe_contact_penalty,
+            weight=-35.0,
+            params={
+                **contact_params,
+                "toe_x_min": 0.12,
+                "toe_y_abs_max": 0.075,
+            },
+        )
+        self.rewards.instep_contact_penalty = RewTerm(
+            func=mdp.side_foot_instep_contact_penalty,
+            weight=-30.0,
+            params={
+                **contact_params,
+                "instep_x_range": (-0.05, 0.15),
+                "instep_y_abs_max": 0.045,
+            },
+        )
+        self.rewards.wrong_side_foot_contact_penalty = RewTerm(
+            func=mdp.ball_side_wrong_foot_contact_penalty,
+            weight=-8.0,
+            params=contact_params,
+        )
+
+        self.rewards.goal_gate_center_success.params["non_side_scale"] = 0.03
+        self.rewards.goal_cross_speed_reward.params["non_side_scale"] = 0.03
+        self.rewards.ball_velocity_to_goal.weight = 0.0
+        self.rewards.medial_ball_velocity_to_goal = RewTerm(
+            func=mdp.side_foot_ball_velocity_to_goal,
+            weight=7.5,
+            params={
+                "command_name": "motion",
+                "speed_scale": 3.0,
+                "corridor_half_width": 0.5,
+                "non_side_scale": 0.03,
+            },
+        )
+        self.rewards.side_foot_ball_speed_lite.weight = 2.0
+
+        arm_joint_targets = {
+            "left_shoulder_pitch_joint": 0.2,
+            "left_shoulder_roll_joint": 0.2,
+            "left_shoulder_yaw_joint": 0.0,
+            "left_elbow_joint": 0.6,
+            "left_wrist_roll_joint": 0.0,
+            "left_wrist_pitch_joint": 0.0,
+            "left_wrist_yaw_joint": 0.0,
+            "right_shoulder_pitch_joint": 0.2,
+            "right_shoulder_roll_joint": -0.2,
+            "right_shoulder_yaw_joint": 0.0,
+            "right_elbow_joint": 0.6,
+            "right_wrist_roll_joint": 0.0,
+            "right_wrist_pitch_joint": 0.0,
+            "right_wrist_yaw_joint": 0.0,
+        }
+        self.rewards.arm_raise_penalty_during_kick = RewTerm(
+            func=mdp.arm_raise_penalty_during_kick,
+            weight=-3.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "post_contact_s": 0.5,
+                "elbow_height_margin": 0.08,
+                "wrist_height_margin": 0.03,
+                "height_scale": 0.20,
+                "joint_margin": 0.65,
+                "joint_scale": 0.85,
+                "arm_joint_targets": arm_joint_targets,
+            },
+        )
+        self.rewards.post_kick_stand_still.weight = 12.0
+        self.rewards.post_kick_arm_neutral = RewTerm(
+            func=mdp.post_kick_arm_neutral,
+            weight=4.0,
+            params={
+                "command_name": "motion",
+                "delay_s": 0.5,
+                "pos_std": 0.45,
+                "vel_std": 3.0,
+                "arm_joint_targets": arm_joint_targets,
+            },
+        )
+        self.rewards.post_kick_upright_feet_planted = RewTerm(
+            func=mdp.post_kick_upright_feet_planted,
+            weight=8.0,
+            params={
+                "command_name": "motion",
+                "foot_cfg": self.foot_cfg,
+                "delay_s": 0.5,
+                "tilt_std": 0.16,
+                "ang_vel_std": 0.9,
+                "drift_std": 0.18,
+                "foot_height_max": 0.075,
+            },
+        )
+        self.rewards.post_kick_drift_penalty.weight = -7.0
+
+
+@configclass
+class G1FlatNearFieldGoalKickV4RecoveryPriorEnvCfg(G1FlatNearFieldGoalKickV4LitePowerEnvCfg):
+    """LitePower-style kicker with geometric medial contact and motion-tail recovery prior."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Keep the 101-dim deploy-native actor observation inherited from
+        # V4Student/LitePower.  All motion-tail information below is reward-only.
+        base_contact_params = {
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "horizontal_force_threshold": 10,
+            "foot_cfg": self.foot_cfg,
+        }
+        contact_params = {
+            **base_contact_params,
+            "center_deadband": 0.08,
+        }
+        self.rewards.target_point_contact = RewTerm(
+            func=mdp.autonomous_target_point_contact,
+            weight=5.0,
+            params=base_contact_params,
+        )
+        self.rewards.inside_foot_contact = RewTerm(
+            func=mdp.geometric_medial_foot_contact_reward,
+            weight=100.0,
+            params={
+                **contact_params,
+                "medial_projection_range": (0.035, 0.155),
+                "side_x_range": (-0.10, 0.12),
+                "z_abs_max": 0.16,
+                "projection_target": 0.09,
+                "projection_std": 0.05,
+            },
+        )
+        self.rewards.lateral_foot_contact_penalty = RewTerm(
+            func=mdp.geometric_lateral_foot_contact_penalty,
+            weight=-45.0,
+            params={
+                **contact_params,
+                "medial_projection_range": (0.035, 0.155),
+                "side_x_range": (-0.10, 0.12),
+                "z_abs_max": 0.16,
+            },
+        )
+        self.rewards.toe_contact_penalty = RewTerm(
+            func=mdp.geometric_toe_contact_penalty,
+            weight=-35.0,
+            params={
+                **contact_params,
+                "toe_x_min": 0.12,
+                "toe_projection_abs_max": 0.075,
+            },
+        )
+        self.rewards.instep_contact_penalty = RewTerm(
+            func=mdp.geometric_instep_contact_penalty,
+            weight=-30.0,
+            params={
+                **contact_params,
+                "instep_x_range": (-0.05, 0.15),
+                "instep_projection_abs_max": 0.045,
+            },
+        )
+        self.rewards.wrong_side_foot_contact_penalty.weight = 0.0
+        self.rewards.wrong_foot_contact_penalty.weight = 0.0
+        self.rewards.sideways_kick.weight = 0.0
+
+        self.rewards.goal_gate_center_success.params["non_side_scale"] = 0.03
+        self.rewards.goal_cross_speed_reward.params["non_side_scale"] = 0.03
+        self.rewards.ball_velocity_direction_alignment.weight = 0.0
+        self.rewards.ball_velocity_to_goal.weight = 0.0
+        self.rewards.medial_ball_velocity_to_goal = RewTerm(
+            func=mdp.side_foot_ball_velocity_to_goal,
+            weight=7.5,
+            params={
+                "command_name": "motion",
+                "speed_scale": 3.0,
+                "corridor_half_width": 0.5,
+                "non_side_scale": 0.03,
+            },
+        )
+        self.rewards.side_foot_ball_speed_lite.weight = 2.0
+
+        arm_joint_targets = {
+            "left_shoulder_pitch_joint": 0.2,
+            "left_shoulder_roll_joint": 0.2,
+            "left_shoulder_yaw_joint": 0.0,
+            "left_elbow_joint": 0.6,
+            "left_wrist_roll_joint": 0.0,
+            "left_wrist_pitch_joint": 0.0,
+            "left_wrist_yaw_joint": 0.0,
+            "right_shoulder_pitch_joint": 0.2,
+            "right_shoulder_roll_joint": -0.2,
+            "right_shoulder_yaw_joint": 0.0,
+            "right_elbow_joint": 0.6,
+            "right_wrist_roll_joint": 0.0,
+            "right_wrist_pitch_joint": 0.0,
+            "right_wrist_yaw_joint": 0.0,
+        }
+        self.rewards.arm_raise_penalty_during_kick = RewTerm(
+            func=mdp.arm_raise_penalty_during_kick,
+            weight=-2.5,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "post_contact_s": 0.5,
+                "elbow_height_margin": 0.08,
+                "wrist_height_margin": 0.03,
+                "height_scale": 0.20,
+                "joint_margin": 0.65,
+                "joint_scale": 0.85,
+                "arm_joint_targets": arm_joint_targets,
+            },
+        )
+        self.rewards.post_kick_stand_still.weight = 10.0
+        self.rewards.post_kick_stand_still.params["delay_s"] = 0.5
+        self.rewards.post_kick_motion_tail_recovery_style = RewTerm(
+            func=mdp.post_kick_motion_tail_recovery_style,
+            weight=12.0,
+            params={
+                "command_name": "motion",
+                "delay_s": 0.35,
+                "tail_frames": 40,
+                "joint_std": 0.45,
+                "joint_vel_std": 2.5,
+                "body_std": 0.22,
+                "tilt_std": 0.16,
+                "ang_vel_std": 1.0,
+                "foot_cfg": self.foot_cfg,
+                "foot_height_max": 0.075,
+            },
+        )
+        self.rewards.post_kick_arm_neutral = RewTerm(
+            func=mdp.post_kick_arm_neutral,
+            weight=4.0,
+            params={
+                "command_name": "motion",
+                "delay_s": 0.5,
+                "pos_std": 0.45,
+                "vel_std": 3.0,
+                "arm_joint_targets": arm_joint_targets,
+            },
+        )
+        self.rewards.post_kick_upright_feet_planted = RewTerm(
+            func=mdp.post_kick_upright_feet_planted,
+            weight=7.0,
+            params={
+                "command_name": "motion",
+                "foot_cfg": self.foot_cfg,
+                "delay_s": 0.5,
+                "tilt_std": 0.16,
+                "ang_vel_std": 0.9,
+                "drift_std": 0.18,
+                "foot_height_max": 0.075,
+            },
+        )
+        self.rewards.post_kick_drift_penalty.weight = -6.0
+
+
+@configclass
+class G1FlatNearFieldGoalKickV4SideFootStableEnvCfg(G1FlatNearFieldGoalKickV4StudentEnvCfg):
+    """V4 student kicker shaped for side-foot contact, approach step and post-kick stillness."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Actor observations stay identical to V4Student.  Ball lateral
+        # position, not the hidden motion label, should drive foot selection.
+        self.commands.motion.goal_aware_ball_lateral_by_kick_leg = False
+        self.commands.motion.goal_aware_ball_y_lat_ranges = (
+            (-0.18, 0.18),
+            (-0.26, 0.26),
+            (-0.35, 0.35),
+        )
+        self.commands.motion.goal_aware_ball_x_front_ranges = (
+            (0.35, 0.65),
+            (0.45, 0.85),
+            (0.55, 0.95),
+        )
+
+        contact_params = {
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "horizontal_force_threshold": 10,
+            "foot_cfg": self.foot_cfg,
+            "center_deadband": 0.08,
+        }
+        self.rewards.target_point_contact = RewTerm(
+            func=mdp.ball_side_expected_target_point_contact,
+            weight=4.0,
+            params=contact_params,
+        )
+        self.rewards.inside_foot_contact = RewTerm(
+            func=mdp.autonomous_side_foot_contact_reward,
+            weight=100.0,
+            params={
+                **contact_params,
+                "inside_y_range": (0.035, 0.145),
+                "side_x_range": (-0.08, 0.11),
+                "z_abs_max": 0.16,
+                "side_y_target": 0.085,
+                "side_y_std": 0.045,
+            },
+        )
+        self.rewards.toe_contact_penalty = RewTerm(
+            func=mdp.side_foot_toe_contact_penalty,
+            weight=-55.0,
+            params={
+                **contact_params,
+                "toe_x_min": 0.12,
+                "toe_y_abs_max": 0.075,
+            },
+        )
+        self.rewards.instep_contact_penalty = RewTerm(
+            func=mdp.side_foot_instep_contact_penalty,
+            weight=-45.0,
+            params={
+                **contact_params,
+                "instep_x_range": (-0.05, 0.15),
+                "instep_y_abs_max": 0.045,
+            },
+        )
+        self.rewards.wrong_side_foot_contact_penalty = RewTerm(
+            func=mdp.ball_side_wrong_foot_contact_penalty,
+            weight=-30.0,
+            params=contact_params,
+        )
+        self.rewards.sideways_kick.weight = 0.0
+        self.rewards.wrong_foot_contact_penalty.weight = 0.0
+
+        self.rewards.goal_gate_center_success = RewTerm(
+            func=mdp.side_foot_goal_gate_center_success,
+            weight=300.0,
+            params={
+                "command_name": "motion",
+                "non_side_scale": 0.05,
+            },
+        )
+        self.rewards.goal_cross_speed_reward = RewTerm(
+            func=mdp.side_foot_goal_cross_speed_reward,
+            weight=60.0,
+            params={
+                "command_name": "motion",
+                "speed_scale": 3.0,
+                "non_side_scale": 0.05,
+            },
+        )
+        self.rewards.ball_velocity_to_goal.weight = 5.0
+        self.rewards.ball_speed_reward.weight = 2.0
+        self.rewards.ball_forward_progress.weight = 5.0
+
+        self.rewards.far_ball_pre_contact_approach = RewTerm(
+            func=mdp.far_ball_pre_contact_approach_reward,
+            weight=5.0,
+            params={
+                "command_name": "motion",
+                "far_ball_x": 0.65,
+                "progress_scale": 0.18,
+            },
+        )
+        self.rewards.far_ball_early_contact_penalty = RewTerm(
+            func=mdp.far_ball_early_contact_penalty,
+            weight=-25.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "far_ball_x": 0.65,
+                "min_root_progress": 0.12,
+            },
+        )
+        self.rewards.torso_pitch_penalty = RewTerm(
+            func=mdp.torso_pitch_penalty,
+            weight=-8.0,
+            params={
+                "command_name": "motion",
+                "body_name": "torso_link",
+                "pitch_threshold": 0.22,
+                "pitch_scale": 0.35,
+                "far_ball_x": 0.65,
+                "far_extra_scale": 1.0,
+            },
+        )
+        self.rewards.post_kick_stand_still = RewTerm(
+            func=mdp.post_kick_stand_still,
+            weight=10.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "foot_cfg": self.foot_cfg,
+                "delay_s": 0.5,
+            },
+        )
+        self.rewards.post_kick_drift_penalty = RewTerm(
+            func=mdp.post_kick_drift_penalty,
+            weight=-6.0,
+            params={
+                "command_name": "motion",
+                "delay_s": 0.5,
+                "drift_limit": 0.18,
+                "drift_scale": 0.30,
+            },
+        )
+
+
+@configclass
+class G1FlatNearFieldGoalKickV4SideFootPowerStableEnvCfg(G1FlatNearFieldGoalKickV4SideFootStableEnvCfg):
+    """V4.1 side-foot stable variant with conservative gated leg and ball speed rewards."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        contact_params = {
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "horizontal_force_threshold": 10,
+            "foot_cfg": self.foot_cfg,
+            "center_deadband": 0.08,
+        }
+
+        self.rewards.goal_cross_speed_reward.weight = 70.0
+        self.rewards.ball_velocity_to_goal.weight = 6.5
+        self.rewards.ball_forward_progress.weight = 5.0
+        self.rewards.ball_speed_reward.weight = 0.0
+
+        self.rewards.style_gated_side_foot_ball_speed = RewTerm(
+            func=mdp.style_gated_side_foot_ball_speed_reward,
+            weight=3.0,
+            params={
+                **contact_params,
+                "std": 2.2,
+                "velocity_threshold": 0.15,
+                "window_steps": 8,
+                "torso_pitch_threshold": 0.18,
+                "torso_pitch_scale": 0.22,
+            },
+        )
+        self.rewards.side_foot_contact_leg_speed = RewTerm(
+            func=mdp.side_foot_contact_leg_speed_reward,
+            weight=6.0,
+            params={
+                **contact_params,
+                "leg_speed_scale": 2.0,
+                "cap": 1.5,
+            },
+        )
+
+
+@configclass
+class G1FlatNearFieldGoalKickV4SideFootPowerStableBoostEnvCfg(G1FlatNearFieldGoalKickV4SideFootPowerStableEnvCfg):
+    """Boosted v4.1 side-foot speed fine-tune, intended for pre-30k checkpoints."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.rewards.goal_cross_speed_reward.weight = 90.0
+        self.rewards.ball_velocity_to_goal.weight = 8.0
+
+        self.rewards.style_gated_side_foot_ball_speed.weight = 6.0
+        self.rewards.style_gated_side_foot_ball_speed.params["std"] = 1.8
+        self.rewards.style_gated_side_foot_ball_speed.params["velocity_threshold"] = 0.10
+        self.rewards.style_gated_side_foot_ball_speed.params["window_steps"] = 12
+
+        self.rewards.side_foot_contact_leg_speed.weight = 10.0
+        self.rewards.side_foot_contact_leg_speed.params["leg_speed_scale"] = 1.5
+        self.rewards.side_foot_contact_leg_speed.params["cap"] = 2.0
+
+
+@configclass
+class G1FlatNearFieldGoalKickV4SideFootSpeedEnvCfg(G1FlatNearFieldGoalKickV4SideFootStableEnvCfg):
+    """V4.1-style kicker fine-tuned for more speed without losing side-foot form."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Keep V4.1's goal-aware distribution.  Do not inherit V4.2's longer
+        # ball window or high real-goal speed rewards; this task is intended to
+        # resume from V4.1-35000 and preserve its motion style.
+        self.rewards.goal_cross_speed_reward.weight = 75.0
+        self.rewards.ball_velocity_to_goal.weight = 8.0
+        self.rewards.ball_speed_reward.weight = 0.0
+        self.rewards.ball_forward_progress.weight = 5.0
+
+        contact_params = {
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "horizontal_force_threshold": 10,
+            "foot_cfg": self.foot_cfg,
+            "center_deadband": 0.08,
+        }
+        self.rewards.style_gated_side_foot_ball_speed = RewTerm(
+            func=mdp.style_gated_side_foot_ball_speed_reward,
+            weight=4.0,
+            params={
+                **contact_params,
+                "std": 2.2,
+                "velocity_threshold": 0.15,
+                "window_steps": 12,
+                "torso_pitch_threshold": 0.18,
+                "torso_pitch_scale": 0.22,
+            },
+        )
+
+        self.rewards.far_ball_pre_contact_approach.weight = 7.0
+        self.rewards.far_ball_early_contact_penalty.weight = -35.0
+        self.rewards.far_ball_early_contact_penalty.params["far_ball_x"] = 0.70
+        self.rewards.far_ball_early_contact_penalty.params["min_root_progress"] = 0.14
+        self.rewards.far_ball_support_step = RewTerm(
+            func=mdp.far_ball_support_step_reward,
+            weight=7.0,
+            params={
+                "command_name": "motion",
+                "foot_cfg": self.foot_cfg,
+                "center_deadband": 0.08,
+                "far_ball_x": 0.70,
+                "support_forward_target": 0.18,
+                "support_forward_min": 0.10,
+                "support_lateral_max": 0.16,
+            },
+        )
+        self.rewards.far_ball_no_support_step_contact = RewTerm(
+            func=mdp.far_ball_no_support_step_contact_penalty,
+            weight=-35.0,
+            params={
+                **contact_params,
+                "far_ball_x": 0.70,
+                "support_forward_target": 0.18,
+                "support_forward_min": 0.10,
+                "support_lateral_max": 0.16,
+            },
+        )
+
+        self.rewards.goal_aware_root_trajectory.weight = 3.0
+        self.rewards.motion_foot_pos.weight = 1.5
+        self.rewards.pre_contact_motion_foot_style = RewTerm(
+            func=mdp.pre_contact_motion_foot_style,
+            weight=2.0,
+            params={
+                "command_name": "motion",
+                "std": 0.22,
+                "foot_body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
+                "far_ball_x": 0.70,
+                "far_extra_scale": 0.5,
+            },
+        )
+        self.rewards.pre_contact_double_air_penalty.weight = -3.0
+        self.rewards.torso_pitch_penalty.weight = -10.0
+        self.rewards.post_kick_stand_still.weight = 10.0
+        self.rewards.post_kick_drift_penalty.weight = -6.0
+
+
+@configclass
+class G1FlatNearFieldGoalKickBeyondMimicTeacherEnvCfg(G1FlatNearFieldGoalKickV4SideFootSpeedEnvCfg):
+    """Reference-conditioned football teacher that keeps the BeyondMimic sim2real contract."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        _apply_beyondmimic_teacher_policy_obs(self)
+
+        # Keep the ten validated motions tied to their intended ball buckets.
+        # If a different motion set is passed, MotionCommand falls back to the
+        # normal V4.1 goal-aware ball sampler instead of failing.
+        self.commands.motion.enable_motion_ball_bucket_sampling = True
+        self.commands.motion.motion_ball_bucket_base_xy_ranges = SOCCER_STANDARD_10_BALL_BUCKETS
+        self.commands.motion.motion_ball_bucket_fallback_to_goal_aware = True
+
+        # Teacher training should preserve the BeyondMimic style before first
+        # contact, then leave enough freedom to add useful shot speed.
+        self.rewards.motion_global_anchor_ori.weight = 2.0
+        self.rewards.motion_body_pos.weight = 3.0
+        self.rewards.motion_body_ori.weight = 3.0
+        self.rewards.motion_body_lin_vel.weight = 2.0
+        self.rewards.motion_body_ang_vel.weight = 2.0
+        self.rewards.motion_foot_pos.weight = 3.0
+        self.rewards.goal_aware_root_trajectory.weight = 4.0
+        self.rewards.pre_contact_motion_foot_style.weight = 4.0
+        self.rewards.pre_contact_motion_style = RewTerm(
+            func=mdp.pre_contact_motion_style_lite,
+            weight=3.0,
+            params={
+                "command_name": "motion",
+                "root_std": 0.30,
+                "foot_std": 0.20,
+                "torso_pitch_threshold": 0.18,
+                "torso_pitch_scale": 0.24,
+                "foot_body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
+                "root_weight": 0.35,
+                "foot_weight": 0.45,
+                "torso_weight": 0.20,
+                "post_contact_scale": 0.12,
+            },
+        )
+
+        self.rewards.goal_cross_speed_reward.weight = 90.0
+        self.rewards.ball_velocity_to_goal.weight = 10.0
+        self.rewards.style_gated_side_foot_ball_speed.weight = 6.0
+        self.rewards.post_kick_stand_still.weight = 4.0
+        self.rewards.post_kick_drift_penalty.weight = -3.0
+
+
+@configclass
+class G1FlatNearFieldGoalKickBeyondMimicStudentDistillEnvCfg(G1FlatNearFieldGoalKickBeyondMimicTeacherEnvCfg):
+    """Distill the BeyondMimic teacher into the deploy-native V4 student observation contract."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        teacher_obs = copy.deepcopy(self.observations.policy)
+        student_obs = _make_beyondmimic_student_policy_obs(teacher_obs)
+        self.observations.teacher = teacher_obs
+        self.observations.policy = student_obs
+
+
+@configclass
+class G1FlatNearFieldGoalKickV4PowerMidGoalEnvCfg(G1FlatNearFieldGoalKickV4SideFootStableEnvCfg):
+    """V4 student kicker focused on stronger mid-range shots and real-goal scoring."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.motion.target_destination_center = (SOCCER_FIELD_LENGTH * 0.5, 0.0, SOCCER_BALL_RADIUS)
+        self.commands.motion.target_destination_length = 0.0
+        self.commands.motion.target_destination_width = 0.0
+        self.commands.motion.goal_gate_real_half_width = SOCCER_GOAL_HALF_WIDTH
+
+        self.commands.motion.goal_aware_robot_x_ranges = (
+            (3.0, 5.2),
+            (1.5, 5.2),
+            (0.5, 5.5),
+        )
+        self.commands.motion.goal_aware_robot_y_ranges = (
+            (-2.2, 2.2),
+            (-3.0, 3.0),
+            (-3.8, 3.8),
+        )
+        self.commands.motion.goal_aware_ball_x_front_ranges = (
+            (0.45, 0.85),
+            (0.45, 0.95),
+            (0.45, 1.05),
+        )
+        self.commands.motion.goal_aware_ball_y_lat_ranges = (
+            (-0.22, 0.22),
+            (-0.30, 0.30),
+            (-0.35, 0.35),
+        )
+
+        contact_params = {
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "horizontal_force_threshold": 10,
+            "foot_cfg": self.foot_cfg,
+            "center_deadband": 0.08,
+        }
+        self.rewards.target_point_contact = RewTerm(
+            func=mdp.ball_side_expected_target_point_contact,
+            weight=4.0,
+            params=contact_params,
+        )
+        self.rewards.inside_foot_contact = RewTerm(
+            func=mdp.autonomous_side_foot_contact_reward,
+            weight=100.0,
+            params={
+                **contact_params,
+                "inside_y_range": (0.035, 0.145),
+                "side_x_range": (-0.08, 0.11),
+                "z_abs_max": 0.16,
+                "side_y_target": 0.085,
+                "side_y_std": 0.045,
+            },
+        )
+        self.rewards.toe_contact_penalty = RewTerm(
+            func=mdp.side_foot_toe_contact_penalty,
+            weight=-55.0,
+            params={
+                **contact_params,
+                "toe_x_min": 0.12,
+                "toe_y_abs_max": 0.075,
+            },
+        )
+        self.rewards.instep_contact_penalty = RewTerm(
+            func=mdp.side_foot_instep_contact_penalty,
+            weight=-45.0,
+            params={
+                **contact_params,
+                "instep_x_range": (-0.05, 0.15),
+                "instep_y_abs_max": 0.045,
+            },
+        )
+        self.rewards.wrong_side_foot_contact_penalty = RewTerm(
+            func=mdp.ball_side_wrong_foot_contact_penalty,
+            weight=-30.0,
+            params=contact_params,
+        )
+        self.rewards.wrong_foot_contact_penalty.weight = 0.0
+
+        self.rewards.goal_gate_success.weight = 0.0
+        self.rewards.goal_gate_miss.weight = 0.0
+        self.rewards.goal_gate_center_success.weight = 0.0
+        self.rewards.goal_cross_speed_reward.weight = 0.0
+        self.rewards.real_goal_center_success = RewTerm(
+            func=mdp.side_foot_real_goal_center_success,
+            weight=350.0,
+            params={
+                "command_name": "motion",
+                "non_side_scale": 0.05,
+            },
+        )
+        self.rewards.real_goal_cross_speed_reward = RewTerm(
+            func=mdp.side_foot_real_goal_cross_speed_reward,
+            weight=120.0,
+            params={
+                "command_name": "motion",
+                "speed_scale": 4.0,
+                "non_side_scale": 0.05,
+            },
+        )
+        self.rewards.real_goal_miss = RewTerm(
+            func=mdp.real_goal_miss,
+            weight=-80.0,
+            params={"command_name": "motion"},
+        )
+
+        self.rewards.ball_speed_reward.weight = 0.0
+        self.rewards.autonomous_ball_speed = RewTerm(
+            func=mdp.autonomous_ball_speed_reward,
+            weight=12.0,
+            params={
+                "command_name": "motion",
+                "std": 2.5,
+                "velocity_threshold": 0.15,
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "window_steps": 12,
+            },
+        )
+        self.rewards.ball_velocity_to_goal.weight = 25.0
+        self.rewards.ball_forward_progress.weight = 8.0
+        self.rewards.ball_lateral_corridor_penalty.weight = -10.0
+        self.rewards.ball_wrong_way_penalty.weight = -12.0
+        self.rewards.ball_z_speed_penalty_reward.weight = -2.0
+        self.rewards.torso_pitch_penalty.weight = -8.0
+        self.rewards.post_kick_stand_still.weight = 10.0
+        self.rewards.post_kick_drift_penalty.weight = -6.0
 
 
 @configclass

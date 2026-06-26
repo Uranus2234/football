@@ -93,7 +93,42 @@ class G1FlatStudentTeacherPPORunnerCfg(G1FlatPPORunnerCfg):
             num_learning_epochs=5,
             learning_rate=1.0e-3,
             gradient_length=24,
-            max_grad_norm=1.0,
+        )
+
+
+@configclass
+class G1FlatBeyondMimicTeacherPPORunnerCfg(G1FlatPPORunnerCfg):
+    """Feed-forward teacher so its actor can be loaded by RSL-RL distillation."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "g1_beyondmimic_football_teacher"
+        self.save_interval = 1000
+        self.policy.actor_hidden_dims = [512, 256, 128]
+        self.policy.critic_hidden_dims = [512, 256, 128]
+
+
+@configclass
+class G1FlatBeyondMimicStudentTeacherRecurrentPPORunnerCfg(G1FlatPPORunnerCfg):
+    """LSTM student distilled from the feed-forward BeyondMimic football teacher."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "g1_beyondmimic_football_student"
+        self.policy = RslRlDistillationStudentTeacherRecurrentCfg(
+            init_noise_std=1.0,
+            student_hidden_dims=[512, 256, 128],
+            teacher_hidden_dims=[512, 256, 128],
+            activation="elu",
+            rnn_type="lstm",
+            rnn_hidden_dim=128,
+            rnn_num_layers=2,
+            teacher_recurrent=False,
+        )
+        self.algorithm = RslRlDistillationAlgorithmCfg(
+            num_learning_epochs=5,
+            learning_rate=1.0e-3,
+            gradient_length=24,
         )
 
 

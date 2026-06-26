@@ -35,6 +35,18 @@ parser.add_argument(
 )
 parser.add_argument("--registry_name", type=str, required=False, help="The name of the wand registry.")
 parser.add_argument("--motion_path", type=str, required=True, help="The path to the motion file or directory containing motion files.")
+parser.add_argument(
+    "--from_scratch",
+    action="store_true",
+    default=False,
+    help="Force a fresh student run and ignore resume loading. Explicit --load_checkpoint_path is still loaded as the teacher.",
+)
+parser.add_argument(
+    "--load_checkpoint_path",
+    type=str,
+    default=None,
+    help="Explicit checkpoint path to load, useful when distilling from a teacher in a different experiment root.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -87,7 +99,7 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -110,6 +122,65 @@ def dump_pickle(filename: str, data):
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "wb") as file:
         pickle.dump(data, file)
+
+
+class RslRlVecEnvWrapper:
+    """Compatibility wrapper for this project's TienKung/RSL-RL runner."""
+
+    def __init__(self, env):
+        self.env = env
+        self.num_envs = self.unwrapped.num_envs
+        self.device = self.unwrapped.device
+        self.max_episode_length = self.unwrapped.max_episode_length
+        if hasattr(self.unwrapped, "action_manager"):
+            self.num_actions = self.unwrapped.action_manager.total_action_dim
+        else:
+            self.num_actions = gym.spaces.flatdim(self.unwrapped.single_action_space)
+        self.env.reset()
+
+    @property
+    def cfg(self):
+        return self.unwrapped.cfg
+
+    @property
+    def unwrapped(self):
+        return self.env.unwrapped
+
+    @property
+    def episode_length_buf(self):
+        return self.unwrapped.episode_length_buf
+
+    @episode_length_buf.setter
+    def episode_length_buf(self, value):
+        self.unwrapped.episode_length_buf = value
+
+    def _split_obs(self, obs_dict, extras=None):
+        if extras is None:
+            extras = {}
+        extras["observations"] = {key: value for key, value in obs_dict.items() if key != "policy"}
+        return obs_dict["policy"], extras
+
+    def reset(self):
+        obs_dict, extras = self.env.reset()
+        return self._split_obs(obs_dict, extras)
+
+    def get_observations(self):
+        if hasattr(self.unwrapped, "observation_manager"):
+            obs_dict = self.unwrapped.observation_manager.compute()
+        else:
+            obs_dict = self.unwrapped._get_observations()
+        return self._split_obs(obs_dict, {})
+
+    def step(self, actions):
+        obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
+        dones = (terminated | truncated).to(dtype=torch.long)
+        if not self.unwrapped.cfg.is_finite_horizon:
+            extras["time_outs"] = truncated
+        obs, extras = self._split_obs(obs_dict, extras)
+        return obs, rew, dones, extras
+
+    def close(self):
+        return self.env.close()
 
 
 def get_motion_files(motion_path: str) -> list[str]:
@@ -144,6 +215,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     """Train with RSL-RL agent."""
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    explicit_resume_load = bool(agent_cfg.resume) or args_cli.load_run is not None or args_cli.checkpoint is not None
+    explicit_teacher_load = args_cli.load_checkpoint_path is not None
+    explicit_checkpoint_load = explicit_teacher_load or explicit_resume_load
+    if args_cli.from_scratch:
+        print("[INFO]: --from_scratch enabled: student resume loading is disabled.")
+        agent_cfg.resume = False
+        agent_cfg.load_run = None
+        agent_cfg.load_checkpoint = None
+        explicit_resume_load = False
+    if not explicit_teacher_load and not explicit_resume_load:
+        if args_cli.from_scratch:
+            print("[INFO]: No explicit teacher checkpoint was provided.")
+        agent_cfg.resume = False
+        agent_cfg.load_run = None
+        agent_cfg.load_checkpoint = None
+    explicit_checkpoint_load = explicit_teacher_load or explicit_resume_load
+
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
@@ -205,9 +293,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir
-    if agent_cfg.resume or agent_cfg.load_run is not None:
-        # get path to previous checkpoint
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    if explicit_checkpoint_load:
+        if args_cli.load_checkpoint_path is not None:
+            resume_path = os.path.abspath(args_cli.load_checkpoint_path)
+        else:
+            # get path to previous checkpoint
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
