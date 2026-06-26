@@ -1838,6 +1838,79 @@ def post_kick_drift_penalty(
     return penalty
 
 
+def post_kick_body_motion_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    horizontal_force_threshold: float = 0.0,
+    delay_s: float = 0.45,
+    global_lin_vel_scale: float = 0.35,
+    global_ang_vel_scale: float = 1.0,
+    local_body_vel_scale: float = 0.45,
+    joint_vel_scale: float = 3.0,
+    body_names: list[str] | None = None,
+    max_penalty: float = 3.0,
+) -> torch.Tensor:
+    """Penalize global drift and local body/joint motion after the kick follow-through."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    tracker = _get_kick_tracker(command)
+    event = tracker.detect(command, ball_sensor_name, horizontal_force_threshold)
+
+    counter = _ensure_reward_int_state(env, command_name, "post_kick_body_motion_counter", default=-1)
+    contact_anchor_xy = _ensure_reward_vec2_state(env, command_name, "post_kick_body_motion_anchor_xy")
+    if torch.any(event.new_contact):
+        counter[event.new_contact] = 0
+        contact_anchor_xy[event.new_contact] = command.robot_anchor_pos_w[event.new_contact, :2].detach()
+
+    delay_steps = max(0, int(round(float(delay_s) / max(float(getattr(env, "step_dt", 0.02)), 1e-6))))
+    active_counter = counter >= 0
+    active = active_counter & (counter >= delay_steps)
+
+    global_lin_vel = torch.linalg.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
+    global_ang_vel = torch.linalg.norm(command.robot_anchor_ang_vel_w, dim=-1)
+
+    body_indexes = _get_body_indexes(command, body_names)
+    if body_indexes:
+        body_lin_vel = command.robot_body_lin_vel_w[:, body_indexes].to(device=env.device, dtype=torch.float32)
+        anchor_lin_vel = command.robot_anchor_lin_vel_w[:, None, :].to(device=env.device, dtype=torch.float32)
+        local_body_vel = torch.sqrt(torch.sum(torch.square(body_lin_vel - anchor_lin_vel), dim=-1).mean(dim=-1))
+    else:
+        local_body_vel = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    joint_vel = torch.linalg.norm(command.robot.data.joint_vel[:, command.controlled_joint_ids], dim=-1) / max(
+        float(command.controlled_joint_ids.numel()) ** 0.5,
+        1.0,
+    )
+
+    penalty = (
+        torch.square(global_lin_vel / max(float(global_lin_vel_scale), 1e-6))
+        + torch.square(global_ang_vel / max(float(global_ang_vel_scale), 1e-6))
+        + torch.square(local_body_vel / max(float(local_body_vel_scale), 1e-6))
+        + torch.square(joint_vel / max(float(joint_vel_scale), 1e-6))
+    )
+    penalty = torch.clamp(penalty, min=0.0, max=float(max_penalty))
+    penalty = torch.where(active, penalty, torch.zeros_like(penalty))
+
+    _ensure_command_metric(command, "post_kick_body_motion_penalty")[:] = penalty.to(torch.float32)
+    _ensure_command_metric(command, "post_kick_global_lin_vel")[:] = torch.where(
+        active_counter, global_lin_vel, torch.zeros_like(global_lin_vel)
+    ).to(torch.float32)
+    _ensure_command_metric(command, "post_kick_global_ang_vel")[:] = torch.where(
+        active_counter, global_ang_vel, torch.zeros_like(global_ang_vel)
+    ).to(torch.float32)
+    _ensure_command_metric(command, "post_kick_local_body_vel")[:] = torch.where(
+        active_counter, local_body_vel, torch.zeros_like(local_body_vel)
+    ).to(torch.float32)
+    _ensure_command_metric(command, "post_kick_body_joint_vel")[:] = torch.where(
+        active_counter, joint_vel, torch.zeros_like(joint_vel)
+    ).to(torch.float32)
+
+    counter = torch.where(active_counter, counter + 1, counter)
+    setattr(env, _reward_state_name(command_name, "post_kick_body_motion_counter"), counter)
+    setattr(env, _reward_state_name(command_name, "post_kick_body_motion_anchor_xy"), contact_anchor_xy)
+    return penalty
+
+
 def arm_raise_penalty_during_kick(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",

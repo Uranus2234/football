@@ -10,13 +10,13 @@ keeping the deploy student interface unchanged:
 - policy observation: 101
 - action dimension: 29
 - motion set: `motions/soccer-standard`
-- recommended start checkpoint: `checkpoints/v4_1_sidefoot_stable_model_25000.pt`
+- start mode: from scratch
 - training scene: robot, ball, target/markers, and the ground plane only
 - play scene: lightweight Soccer_Lab field visuals are added by `play.py`
 
-The 25k checkpoint is intentionally used instead of 30k+ because 30k is already
-close to the converged slow-kick policy. At 25k the policy still has usable
-side-foot/correct-foot signal and leaves more room for power shaping.
+Do not load the old 25k checkpoint for new experiments. New power-stable,
+lift, and post-still runs should start from scratch so the policy can learn the
+full speed, gait, and recovery behavior under the current reward set.
 
 ## Prerequisites
 
@@ -31,7 +31,7 @@ pip install -e source/whole_body_tracking
 If your Isaac Lab environment is managed by conda, activate it before running
 the commands below.
 
-## Main Fine-Tune
+## Main From-Scratch Training
 
 ```bash
 cd /path/to/HumanoidSoccer
@@ -40,8 +40,8 @@ python scripts/rsl_rl/train_student.py \
   --task Tracking-Flat-G1-NearFieldGoalKickV4SideFootPowerStableBoost-RNN-v0 \
   --num_envs 4096 \
   --motion_path motions/soccer-standard \
-  --load_checkpoint_path checkpoints/v4_1_sidefoot_stable_model_25000.pt \
-  --run_name nearfield_goalkick_v4_1_powerstable_boost_ft25000_4096 \
+  --from_scratch \
+  --run_name nearfield_goalkick_v4_1_powerstable_boost_from0_4096 \
   --max_iterations 45000 \
   --headless
 ```
@@ -49,7 +49,7 @@ python scripts/rsl_rl/train_student.py \
 Equivalent helper:
 
 ```bash
-bash shell/train_v4_1_powerstable_boost_ft25000.sh
+bash shell/train_v4_1_powerstable_boost_from0.sh
 ```
 
 ## Playback
@@ -62,7 +62,7 @@ does not load the original `goalpost.usd` unless `--play_goalpost_usd` is set.
 python scripts/rsl_rl/play.py \
   --task Tracking-Flat-G1-NearFieldGoalKickV4SideFootPowerStableBoost-RNN-v0 \
   --num_envs 1 \
-  --load_run <timestamp>_nearfield_goalkick_v4_1_powerstable_boost_ft25000_4096 \
+  --load_run <timestamp>_nearfield_goalkick_v4_1_powerstable_boost_from0_4096 \
   --checkpoint model_<iter>.pt \
   --play_goal_init_stage 3 \
   --play_face_goal \

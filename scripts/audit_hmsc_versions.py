@@ -138,11 +138,11 @@ VERSIONS = (
         "Planned v4.1 finetune from model_10000 with gated leg-speed and ball-speed rewards.",
     ),
     VersionSpec(
-        "V4.1 power-stable boost ft25000",
+        "V4.1 power-stable boost from0",
         "Tracking-Flat-G1-NearFieldGoalKickV4SideFootPowerStableBoost-RNN-v0",
-        "nearfield_goalkick_v4_1_powerstable_boost_ft25000_4096",
+        "nearfield_goalkick_v4_1_powerstable_boost_from0_4096",
         None,
-        "Boosted speed branch after play audit; intended to resume from v4.1 model_25000, not 30000+.",
+        "Boosted speed branch after play audit; new runs should train from scratch under the current reward set.",
     ),
     VersionSpec(
         "V4.1 power-stable from0",
@@ -404,7 +404,7 @@ def build_report(include_scalars: bool, versions: tuple[VersionSpec, ...] = VERS
     lines.append("")
     lines.append("## Recommended Direction")
     lines.append("")
-    lines.append("Keep V4.1 side-foot stable as the deploy baseline. After the ft10000 play audit, prefer the V4.1 power-stable boost branch from model_25000 for the next speed fine-tune; keep V4.2/lite-power experimental until they have mature checkpoints, exported ONNX, check-only, and fixed-ball MuJoCo validation.")
+    lines.append("Keep V4.1 side-foot stable as the deploy baseline. For new speed, lift, and post-still experiments, prefer from-scratch training under the current reward set; keep V4.2/lite-power experimental until they have mature checkpoints, exported ONNX, check-only, and fixed-ball MuJoCo validation.")
     lines.append("")
     return "\n".join(lines)
 

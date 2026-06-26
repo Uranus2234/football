@@ -1778,6 +1778,77 @@ class G1FlatNearFieldGoalKickV4SideFootPowerStableLiftEnvCfg(G1FlatNearFieldGoal
 
 
 @configclass
+class G1FlatNearFieldGoalKickV4SideFootPowerStableLiftPostStillEnvCfg(
+    G1FlatNearFieldGoalKickV4SideFootPowerStableLiftEnvCfg
+):
+    """Lift task with stricter post-kick stillness, upright posture and neutral arms."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        arm_joint_targets = {
+            "left_shoulder_pitch_joint": 0.2,
+            "left_shoulder_roll_joint": 0.2,
+            "left_shoulder_yaw_joint": 0.0,
+            "left_elbow_joint": 0.6,
+            "left_wrist_roll_joint": 0.0,
+            "left_wrist_pitch_joint": 0.0,
+            "left_wrist_yaw_joint": 0.0,
+            "right_shoulder_pitch_joint": 0.2,
+            "right_shoulder_roll_joint": -0.2,
+            "right_shoulder_yaw_joint": 0.0,
+            "right_elbow_joint": 0.6,
+            "right_wrist_roll_joint": 0.0,
+            "right_wrist_pitch_joint": 0.0,
+            "right_wrist_yaw_joint": 0.0,
+        }
+
+        self.rewards.post_kick_stand_still.weight = 12.0
+        self.rewards.post_kick_drift_penalty.weight = -8.0
+        self.rewards.post_kick_drift_penalty.params["drift_limit"] = 0.12
+        self.rewards.post_kick_drift_penalty.params["drift_scale"] = 0.20
+        self.rewards.post_kick_body_motion_penalty = RewTerm(
+            func=mdp.post_kick_body_motion_penalty,
+            weight=-8.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "horizontal_force_threshold": 10,
+                "delay_s": 0.45,
+                "global_lin_vel_scale": 0.35,
+                "global_ang_vel_scale": 1.0,
+                "local_body_vel_scale": 0.45,
+                "joint_vel_scale": 3.0,
+                "max_penalty": 3.0,
+            },
+        )
+        self.rewards.post_kick_upright_feet_planted = RewTerm(
+            func=mdp.post_kick_upright_feet_planted,
+            weight=8.0,
+            params={
+                "command_name": "motion",
+                "foot_cfg": self.foot_cfg,
+                "delay_s": 0.5,
+                "tilt_std": 0.16,
+                "ang_vel_std": 0.9,
+                "drift_std": 0.18,
+                "foot_height_max": 0.075,
+            },
+        )
+        self.rewards.post_kick_arm_neutral = RewTerm(
+            func=mdp.post_kick_arm_neutral,
+            weight=5.0,
+            params={
+                "command_name": "motion",
+                "delay_s": 0.5,
+                "pos_std": 0.45,
+                "vel_std": 3.0,
+                "arm_joint_targets": arm_joint_targets,
+            },
+        )
+
+
+@configclass
 class G1FlatNearFieldGoalKickV4SideFootSpeedEnvCfg(G1FlatNearFieldGoalKickV4SideFootStableEnvCfg):
     """V4.1-style kicker fine-tuned for more speed without losing side-foot form."""
 

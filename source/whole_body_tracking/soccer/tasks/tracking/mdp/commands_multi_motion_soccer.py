@@ -300,6 +300,13 @@ class MotionCommand(CommandTerm):
         self.metrics["pre_contact_swing_foot_clearance_reward"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["pre_contact_step_length"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["pre_contact_step_length_reward"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["post_kick_body_motion_penalty"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["post_kick_global_lin_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["post_kick_global_ang_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["post_kick_local_body_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["post_kick_body_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["post_kick_arm_neutral"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["post_kick_upright_feet_planted"] = torch.zeros(self.num_envs, device=self.device)
 
         # Target-point and soccer-ball generation logic.
         self.target_point_pos = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
