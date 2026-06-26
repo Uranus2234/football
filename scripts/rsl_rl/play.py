@@ -28,6 +28,13 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
 parser.add_argument(
+    "--robot_variant",
+    type=str,
+    choices=("main", "mode15"),
+    default="main",
+    help="G1 robot variant to use for play. Use mode15 for checkpoints trained with --robot_variant mode15.",
+)
+parser.add_argument(
     "--motion_path",
     type=str,
     default=None,
@@ -124,6 +131,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
+from soccer.robots.g1 import apply_g1_robot_variant
 from soccer.tasks.tracking.config.g1.soccer_flat_env_cfg import install_soccer_lab_field
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx, export_student_policy_as_onnx
 
@@ -312,6 +320,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     """Play with RSL-RL agent."""
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    apply_g1_robot_variant(env_cfg, args_cli.robot_variant)
+    print(f"[INFO]: Using G1 robot variant: {args_cli.robot_variant}")
     _apply_play_robot_pose_range(env_cfg, args_cli.play_robot_pose_range)
     _apply_play_face_goal(env_cfg, args_cli.play_face_goal, args_cli.play_face_goal_yaw_offset_deg)
     _apply_play_goal_init_stage(env_cfg, args_cli.play_goal_init_stage)

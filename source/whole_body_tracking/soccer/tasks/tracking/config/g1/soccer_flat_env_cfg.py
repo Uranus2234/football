@@ -1737,6 +1737,47 @@ class G1FlatNearFieldGoalKickV4SideFootPowerStableBoostEnvCfg(G1FlatNearFieldGoa
 
 
 @configclass
+class G1FlatNearFieldGoalKickV4SideFootPowerStableLiftEnvCfg(G1FlatNearFieldGoalKickV4SideFootPowerStableBoostEnvCfg):
+    """PowerStableBoost with pre-contact gait shaping for higher, cleaner steps."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.rewards.pre_contact_feet_slip_penalty = RewTerm(
+            func=mdp.pre_contact_feet_slip_penalty,
+            weight=-1.5,
+            params={
+                "command_name": "motion",
+                "foot_cfg": self.foot_cfg,
+                "contact_force_threshold": 5.0,
+            },
+        )
+        self.rewards.pre_contact_swing_foot_clearance_reward = RewTerm(
+            func=mdp.pre_contact_swing_foot_clearance_reward,
+            weight=4.0,
+            params={
+                "command_name": "motion",
+                "foot_cfg": self.foot_cfg,
+                "contact_force_threshold": 5.0,
+                "target_clearance": 0.085,
+                "cap": 0.14,
+            },
+        )
+        self.rewards.pre_contact_step_length_reward = RewTerm(
+            func=mdp.pre_contact_step_length_reward,
+            weight=2.0,
+            params={
+                "command_name": "motion",
+                "foot_cfg": self.foot_cfg,
+                "min_ball_distance": 0.30,
+                "target_step_length": 0.28,
+                "cap": 0.42,
+            },
+        )
+        self.rewards.pre_contact_double_air_penalty.weight = -3.0
+
+
+@configclass
 class G1FlatNearFieldGoalKickV4SideFootSpeedEnvCfg(G1FlatNearFieldGoalKickV4SideFootStableEnvCfg):
     """V4.1-style kicker fine-tuned for more speed without losing side-foot form."""
 

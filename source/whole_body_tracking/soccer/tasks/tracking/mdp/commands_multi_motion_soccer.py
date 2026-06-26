@@ -293,6 +293,13 @@ class MotionCommand(CommandTerm):
         self.metrics["sim2real_perception_latency_s"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sim2real_actuator_delay_steps"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sim2real_actuator_delay_max_steps"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["pre_contact_foot_slip"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["pre_contact_feet_slip_penalty"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["pre_contact_swing_foot_clearance"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["pre_contact_has_support"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["pre_contact_swing_foot_clearance_reward"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["pre_contact_step_length"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["pre_contact_step_length_reward"] = torch.zeros(self.num_envs, device=self.device)
 
         # Target-point and soccer-ball generation logic.
         self.target_point_pos = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)

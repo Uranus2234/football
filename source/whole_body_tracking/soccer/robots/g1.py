@@ -92,6 +92,13 @@ DAMPING_7520_14 = 2.0 * DAMPING_RATIO * ARMATURE_7520_14 * NATURAL_FREQ
 DAMPING_7520_22 = 2.0 * DAMPING_RATIO * ARMATURE_7520_22 * NATURAL_FREQ
 DAMPING_4010 = 2.0 * DAMPING_RATIO * ARMATURE_4010 * NATURAL_FREQ
 
+# Isolated placeholders for mode15 wrist pitch/yaw gains. They intentionally do
+# not share the main robot symbols so a real mode15 kp/kd table can replace them
+# without changing the main G1 training setup.
+ARMATURE_MODE15_WRIST_PY = ARMATURE_4010
+STIFFNESS_MODE15_WRIST_PY = ARMATURE_MODE15_WRIST_PY * NATURAL_FREQ**2
+DAMPING_MODE15_WRIST_PY = 2.0 * DAMPING_RATIO * ARMATURE_MODE15_WRIST_PY * NATURAL_FREQ
+
 G1_CYLINDER_CFG = ArticulationCfg(
     spawn=sim_utils.UrdfFileCfg(
         fix_base=False,
@@ -266,15 +273,165 @@ G1_CYLINDER_D455_CFG.actuators["sensors"] = ImplicitActuatorCfg(
     armature=0.001,
 )
 
-G1_ACTION_SCALE = {}
-for a in G1_CYLINDER_CFG.actuators.values():
-    e = a.effort_limit_sim
-    s = a.stiffness
-    names = a.joint_names_expr
-    if not isinstance(e, dict):
-        e = {n: e for n in names}
-    if not isinstance(s, dict):
-        s = {n: s for n in names}
-    for n in names:
-        if n in e and n in s and s[n]:
-            G1_ACTION_SCALE[n] = 0.25 * e[n] / s[n]
+G1_MODE15_CFG = copy.deepcopy(G1_CYLINDER_CFG)
+G1_MODE15_CFG.spawn.asset_path = f"{ASSET_DIR}/unitree_description/urdf/g1_mode15/g1_29dof_mode_15.urdf"
+G1_MODE15_CFG.actuators = {
+    "legs": ImplicitActuatorCfg(
+        joint_names_expr=[
+            ".*_hip_yaw_joint",
+            ".*_hip_roll_joint",
+            ".*_hip_pitch_joint",
+            ".*_knee_joint",
+        ],
+        effort_limit_sim={
+            ".*_hip_yaw_joint": 88.0,
+            ".*_hip_roll_joint": 139.0,
+            ".*_hip_pitch_joint": 139.0,
+            ".*_knee_joint": 139.0,
+        },
+        velocity_limit_sim={
+            ".*_hip_yaw_joint": 32.0,
+            ".*_hip_roll_joint": 20.0,
+            ".*_hip_pitch_joint": 20.0,
+            ".*_knee_joint": 20.0,
+        },
+        stiffness={
+            ".*_hip_pitch_joint": STIFFNESS_7520_22,
+            ".*_hip_roll_joint": STIFFNESS_7520_22,
+            ".*_hip_yaw_joint": STIFFNESS_7520_14,
+            ".*_knee_joint": STIFFNESS_7520_22,
+        },
+        damping={
+            ".*_hip_pitch_joint": DAMPING_7520_22,
+            ".*_hip_roll_joint": DAMPING_7520_22,
+            ".*_hip_yaw_joint": DAMPING_7520_14,
+            ".*_knee_joint": DAMPING_7520_22,
+        },
+        armature={
+            ".*_hip_pitch_joint": ARMATURE_7520_22,
+            ".*_hip_roll_joint": ARMATURE_7520_22,
+            ".*_hip_yaw_joint": ARMATURE_7520_14,
+            ".*_knee_joint": ARMATURE_7520_22,
+        },
+    ),
+    "feet": ImplicitActuatorCfg(
+        effort_limit_sim=35.0,
+        velocity_limit_sim=30.0,
+        joint_names_expr=[".*_ankle_pitch_joint", ".*_ankle_roll_joint"],
+        stiffness=STIFFNESS_5020,
+        damping=DAMPING_5020,
+        armature=ARMATURE_5020,
+    ),
+    "waist": ImplicitActuatorCfg(
+        effort_limit_sim=35.0,
+        velocity_limit_sim=30.0,
+        joint_names_expr=["waist_roll_joint", "waist_pitch_joint"],
+        stiffness=STIFFNESS_5020,
+        damping=DAMPING_5020,
+        armature=ARMATURE_5020,
+    ),
+    "waist_yaw": ImplicitActuatorCfg(
+        effort_limit_sim=88.0,
+        velocity_limit_sim=32.0,
+        joint_names_expr=["waist_yaw_joint"],
+        stiffness=STIFFNESS_7520_14,
+        damping=DAMPING_7520_14,
+        armature=ARMATURE_7520_14,
+    ),
+    "arms": ImplicitActuatorCfg(
+        joint_names_expr=[
+            ".*_shoulder_pitch_joint",
+            ".*_shoulder_roll_joint",
+            ".*_shoulder_yaw_joint",
+            ".*_elbow_joint",
+            ".*_wrist_roll_joint",
+            ".*_wrist_pitch_joint",
+            ".*_wrist_yaw_joint",
+        ],
+        effort_limit_sim={
+            ".*_shoulder_pitch_joint": 25.0,
+            ".*_shoulder_roll_joint": 25.0,
+            ".*_shoulder_yaw_joint": 25.0,
+            ".*_elbow_joint": 25.0,
+            ".*_wrist_roll_joint": 25.0,
+            ".*_wrist_pitch_joint": 13.4,
+            ".*_wrist_yaw_joint": 13.4,
+        },
+        velocity_limit_sim={
+            ".*_shoulder_pitch_joint": 37.0,
+            ".*_shoulder_roll_joint": 37.0,
+            ".*_shoulder_yaw_joint": 37.0,
+            ".*_elbow_joint": 37.0,
+            ".*_wrist_roll_joint": 37.0,
+            ".*_wrist_pitch_joint": 27.0,
+            ".*_wrist_yaw_joint": 27.0,
+        },
+        stiffness={
+            ".*_shoulder_pitch_joint": STIFFNESS_5020,
+            ".*_shoulder_roll_joint": STIFFNESS_5020,
+            ".*_shoulder_yaw_joint": STIFFNESS_5020,
+            ".*_elbow_joint": STIFFNESS_5020,
+            ".*_wrist_roll_joint": STIFFNESS_5020,
+            ".*_wrist_pitch_joint": STIFFNESS_MODE15_WRIST_PY,
+            ".*_wrist_yaw_joint": STIFFNESS_MODE15_WRIST_PY,
+        },
+        damping={
+            ".*_shoulder_pitch_joint": DAMPING_5020,
+            ".*_shoulder_roll_joint": DAMPING_5020,
+            ".*_shoulder_yaw_joint": DAMPING_5020,
+            ".*_elbow_joint": DAMPING_5020,
+            ".*_wrist_roll_joint": DAMPING_5020,
+            ".*_wrist_pitch_joint": DAMPING_MODE15_WRIST_PY,
+            ".*_wrist_yaw_joint": DAMPING_MODE15_WRIST_PY,
+        },
+        armature={
+            ".*_shoulder_pitch_joint": ARMATURE_5020,
+            ".*_shoulder_roll_joint": ARMATURE_5020,
+            ".*_shoulder_yaw_joint": ARMATURE_5020,
+            ".*_elbow_joint": ARMATURE_5020,
+            ".*_wrist_roll_joint": ARMATURE_5020,
+            ".*_wrist_pitch_joint": ARMATURE_MODE15_WRIST_PY,
+            ".*_wrist_yaw_joint": ARMATURE_MODE15_WRIST_PY,
+        },
+    ),
+}
+
+
+def _compute_action_scale(robot_cfg: ArticulationCfg) -> dict[str, float]:
+    action_scale = {}
+    for actuator_cfg in robot_cfg.actuators.values():
+        effort = actuator_cfg.effort_limit_sim
+        stiffness = actuator_cfg.stiffness
+        names = actuator_cfg.joint_names_expr
+        if not isinstance(effort, dict):
+            effort = {name: effort for name in names}
+        if not isinstance(stiffness, dict):
+            stiffness = {name: stiffness for name in names}
+        for name in names:
+            if name in effort and name in stiffness and stiffness[name]:
+                action_scale[name] = 0.25 * effort[name] / stiffness[name]
+    return action_scale
+
+
+G1_ACTION_SCALE = _compute_action_scale(G1_CYLINDER_CFG)
+G1_MODE15_ACTION_SCALE = _compute_action_scale(G1_MODE15_CFG)
+
+G1_ROBOT_VARIANTS = {
+    "main": (G1_CYLINDER_CFG, G1_ACTION_SCALE),
+    "mode15": (G1_MODE15_CFG, G1_MODE15_ACTION_SCALE),
+}
+
+
+def get_g1_robot_variant(robot_variant: str) -> tuple[ArticulationCfg, dict[str, float]]:
+    variant = str(robot_variant).lower()
+    if variant not in G1_ROBOT_VARIANTS:
+        valid = ", ".join(sorted(G1_ROBOT_VARIANTS))
+        raise ValueError(f"Unknown G1 robot variant '{robot_variant}'. Expected one of: {valid}.")
+    return G1_ROBOT_VARIANTS[variant]
+
+
+def apply_g1_robot_variant(env_cfg, robot_variant: str, prim_path: str = "{ENV_REGEX_NS}/Robot") -> None:
+    robot_cfg, action_scale = get_g1_robot_variant(robot_variant)
+    env_cfg.scene.robot = robot_cfg.replace(prim_path=prim_path)
+    env_cfg.actions.joint_pos.scale = action_scale
+    env_cfg.robot_variant = str(robot_variant).lower()

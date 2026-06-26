@@ -2125,6 +2125,62 @@ def foot_distance(env: ManagerBasedRLEnv, threshold: float, std: float, foot_cfg
     return reward
 
 
+def _get_scene_sensor(env: ManagerBasedRLEnv, sensor_name: str):
+    sensors = getattr(env.scene, "sensors", None)
+    if sensors is None:
+        return None
+    try:
+        return sensors[sensor_name] if isinstance(sensors, dict) else getattr(sensors, sensor_name, None)
+    except (KeyError, AttributeError, TypeError):
+        return None
+
+
+def _contact_forces_w(env: ManagerBasedRLEnv, sensor_name: str) -> torch.Tensor | None:
+    contact_sensor = _get_scene_sensor(env, sensor_name)
+    if contact_sensor is None:
+        return None
+    forces_data = contact_sensor.data
+    forces = None
+    if hasattr(forces_data, "net_forces_w_history"):
+        forces_hist = forces_data.net_forces_w_history
+        if forces_hist is not None and forces_hist.numel() > 0:
+            forces = forces_hist.to(env.device)
+            if forces.ndim >= 4:
+                forces = forces.amax(dim=1)
+    if forces is None and hasattr(forces_data, "net_forces_w"):
+        forces = forces_data.net_forces_w
+        if forces is not None and forces.numel() > 0:
+            forces = forces.to(env.device)
+    if forces is None or forces.ndim < 3:
+        return None
+    return forces
+
+
+def _foot_contact_mask(
+    env: ManagerBasedRLEnv,
+    foot_cfg: SceneEntityCfg,
+    sensor_name: str,
+    contact_force_threshold: float,
+) -> torch.Tensor | None:
+    contact_sensor = _get_scene_sensor(env, sensor_name)
+    forces = _contact_forces_w(env, sensor_name)
+    if contact_sensor is None or forces is None:
+        return None
+
+    key = (sensor_name, tuple(foot_cfg.body_names))
+    if not hasattr(contact_sensor, "_reward_foot_indices_cache"):
+        contact_sensor._reward_foot_indices_cache = {}
+    if key not in contact_sensor._reward_foot_indices_cache:
+        sensor_indices = contact_sensor.find_bodies(foot_cfg.body_names, preserve_order=True)[0]
+        contact_sensor._reward_foot_indices_cache[key] = torch.as_tensor(
+            sensor_indices, device=env.device, dtype=torch.long
+        )
+    foot_indices = contact_sensor._reward_foot_indices_cache[key]
+    if foot_indices.numel() == 0 or forces.shape[1] <= int(foot_indices.max()):
+        return None
+    return forces[:, foot_indices, 2] > float(contact_force_threshold)
+
+
 def feet_slip_penalty(env: ManagerBasedRLEnv, foot_cfg: SceneEntityCfg, slip_force_threshold: float,) -> torch.Tensor:
     """Penalize foot linear velocity when the foot is in contact.
 
@@ -2195,6 +2251,138 @@ def feet_slip_penalty(env: ManagerBasedRLEnv, foot_cfg: SceneEntityCfg, slip_for
         return penalize.reshape(num_envs, -1).sum(dim=1)
     else:
         return torch.sum(penalize, dim=(1, 2))
+
+
+def pre_contact_feet_slip_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    foot_cfg: SceneEntityCfg | None = None,
+    sensor_name: str = "contact_forces",
+    contact_force_threshold: float = 5.0,
+) -> torch.Tensor:
+    """Penalize horizontal foot speed while the foot is planted before ball contact."""
+    if foot_cfg is None:
+        raise ValueError("pre_contact_feet_slip_penalty requires foot_cfg.")
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    tracker = _get_kick_tracker(command)
+    pre_contact = ~tracker.get_contact_awarded().to(device=env.device, dtype=torch.bool)
+
+    contact_mask = _foot_contact_mask(env, foot_cfg, sensor_name, contact_force_threshold)
+    if contact_mask is None:
+        slip = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+    else:
+        robot = env.scene[foot_cfg.name]
+        robot_foot_indices = torch.as_tensor(
+            robot.find_bodies(foot_cfg.body_names, preserve_order=True)[0],
+            device=env.device,
+            dtype=torch.long,
+        )
+        foot_vel_xy = robot.data.body_lin_vel_w[:, robot_foot_indices, :2]
+        planted_vel_xy = torch.where(contact_mask.unsqueeze(-1), foot_vel_xy, torch.zeros_like(foot_vel_xy))
+        slip = torch.sum(torch.square(planted_vel_xy), dim=(1, 2))
+
+    penalty = torch.where(pre_contact, slip, torch.zeros_like(slip))
+    _ensure_command_metric(command, "pre_contact_foot_slip")[:] = penalty.to(torch.float32)
+    _ensure_command_metric(command, "pre_contact_feet_slip_penalty")[:] = penalty.to(torch.float32)
+    return penalty
+
+
+def pre_contact_swing_foot_clearance_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    foot_cfg: SceneEntityCfg | None = None,
+    sensor_name: str = "contact_forces",
+    contact_force_threshold: float = 5.0,
+    target_clearance: float = 0.085,
+    cap: float = 0.14,
+) -> torch.Tensor:
+    """Reward swing-foot clearance relative to a planted support foot before contact."""
+    if foot_cfg is None:
+        raise ValueError("pre_contact_swing_foot_clearance_reward requires foot_cfg.")
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    tracker = _get_kick_tracker(command)
+    pre_contact = ~tracker.get_contact_awarded().to(device=env.device, dtype=torch.bool)
+
+    contact_mask = _foot_contact_mask(env, foot_cfg, sensor_name, contact_force_threshold)
+    robot = env.scene[foot_cfg.name]
+    robot_foot_indices = torch.as_tensor(
+        robot.find_bodies(foot_cfg.body_names, preserve_order=True)[0],
+        device=env.device,
+        dtype=torch.long,
+    )
+    foot_z = robot.data.body_pos_w[:, robot_foot_indices, 2]
+
+    if contact_mask is None:
+        has_support = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        swing_clearance = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+    else:
+        has_support = torch.any(contact_mask, dim=-1)
+        support_count = contact_mask.to(torch.float32).sum(dim=-1).clamp(min=1.0)
+        support_z = torch.sum(torch.where(contact_mask, foot_z, torch.zeros_like(foot_z)), dim=-1) / support_count
+        swing_mask = ~contact_mask
+        clearance = torch.clamp(foot_z - support_z.unsqueeze(-1), min=0.0)
+        clearance = torch.where(swing_mask, clearance, torch.zeros_like(clearance))
+        swing_clearance = clearance.max(dim=-1).values
+
+    active = pre_contact & has_support
+    capped_clearance = torch.clamp(swing_clearance, min=0.0, max=float(cap))
+    reward = torch.where(
+        active,
+        capped_clearance / max(float(target_clearance), 1e-6),
+        torch.zeros_like(capped_clearance),
+    )
+
+    _ensure_command_metric(command, "pre_contact_swing_foot_clearance")[:] = torch.where(
+        pre_contact, swing_clearance, torch.zeros_like(swing_clearance)
+    ).to(torch.float32)
+    _ensure_command_metric(command, "pre_contact_has_support")[:] = (pre_contact & has_support).to(torch.float32)
+    _ensure_command_metric(command, "pre_contact_swing_foot_clearance_reward")[:] = reward.to(torch.float32)
+    return reward
+
+
+def pre_contact_step_length_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    foot_cfg: SceneEntityCfg | None = None,
+    min_ball_distance: float = 0.30,
+    target_step_length: float = 0.28,
+    cap: float = 0.42,
+) -> torch.Tensor:
+    """Reward a slightly longer sagittal step before the robot reaches the ball."""
+    if foot_cfg is None:
+        raise ValueError("pre_contact_step_length_reward requires foot_cfg.")
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    tracker = _get_kick_tracker(command)
+    pre_contact = ~tracker.get_contact_awarded().to(device=env.device, dtype=torch.bool)
+
+    robot = env.scene[foot_cfg.name]
+    robot_foot_indices = torch.as_tensor(
+        robot.find_bodies(foot_cfg.body_names, preserve_order=True)[0],
+        device=env.device,
+        dtype=torch.long,
+    )
+    foot_pos_xy = robot.data.body_pos_w[:, robot_foot_indices, :2]
+    foot_delta_xy = foot_pos_xy[:, 0] - foot_pos_xy[:, 1]
+    direction_xy = _goal_direction_xy(command).to(device=env.device, dtype=foot_delta_xy.dtype)
+    step_length = torch.abs(torch.sum(foot_delta_xy * direction_xy, dim=-1))
+
+    ball_distance = torch.linalg.norm(command.target_point_pos[:, :2] - command.robot_anchor_pos_w[:, :2], dim=-1)
+    active = pre_contact & (ball_distance > float(min_ball_distance))
+    capped_length = torch.clamp(step_length, min=0.0, max=float(cap))
+    reward = torch.where(
+        active,
+        capped_length / max(float(target_step_length), 1e-6),
+        torch.zeros_like(capped_length),
+    )
+
+    _ensure_command_metric(command, "pre_contact_step_length")[:] = torch.where(
+        pre_contact, step_length, torch.zeros_like(step_length)
+    ).to(torch.float32)
+    _ensure_command_metric(command, "pre_contact_step_length_reward")[:] = reward.to(torch.float32)
+    return reward
     
 
 def target_point_proximity(env: ManagerBasedRLEnv, std: float, command_name: str = "motion",) -> torch.Tensor:

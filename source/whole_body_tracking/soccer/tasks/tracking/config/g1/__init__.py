@@ -239,6 +239,17 @@ gym.register(
 
 
 gym.register(
+    id="Tracking-Flat-G1-NearFieldGoalKickV4SideFootPowerStableLift-RNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1FlatNearFieldGoalKickV4SideFootPowerStableLiftEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatRecurrentLargePPORunnerCfg",
+    },
+)
+
+
+gym.register(
     id="Tracking-Flat-G1-NearFieldGoalKickV4LitePower-RNN-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

@@ -36,6 +36,13 @@ parser.add_argument(
 parser.add_argument("--registry_name", type=str, required=False, help="The name of the wand registry.")
 parser.add_argument("--motion_path", type=str, required=True, help="The path to the motion file or directory containing motion files.")
 parser.add_argument(
+    "--robot_variant",
+    type=str,
+    choices=("main", "mode15"),
+    default="main",
+    help="G1 robot variant to use for training. Use mode15 to load the mode15 URDF and actuator gains.",
+)
+parser.add_argument(
     "--from_scratch",
     action="store_true",
     default=False,
@@ -105,6 +112,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
+from soccer.robots.g1 import apply_g1_robot_variant
 from soccer.utils.my_on_policy_runner import MotionOnPolicyRunner as OnPolicyRunner
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -236,6 +244,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+    apply_g1_robot_variant(env_cfg, args_cli.robot_variant)
+    print(f"[INFO]: Using G1 robot variant: {args_cli.robot_variant}")
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
