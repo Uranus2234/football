@@ -63,6 +63,18 @@ parser.add_argument(
     default=False,
     help="Play-only reset override for midfield/mid-range shots instead of near-goal Stage-A starts.",
 )
+parser.add_argument(
+    "--play_no_soccer_field",
+    action="store_true",
+    default=False,
+    help="Disable Soccer_Lab field visuals during play.",
+)
+parser.add_argument(
+    "--play_goalpost_usd",
+    action="store_true",
+    default=False,
+    help="Use the original Soccer_Lab goalpost USD during play. By default play uses lightweight cuboid posts.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -120,6 +132,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
+from soccer.tasks.tracking.config.g1.soccer_flat_env_cfg import install_soccer_lab_field
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx, export_student_policy_as_onnx
 
 
@@ -301,6 +314,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _apply_play_face_goal(env_cfg, args_cli.play_face_goal, args_cli.play_face_goal_yaw_offset_deg)
     _apply_play_goal_init_stage(env_cfg, args_cli.play_goal_init_stage)
     _apply_play_midfield_kick(env_cfg, args_cli.play_midfield_kick)
+
+    if not args_cli.play_no_soccer_field:
+        install_soccer_lab_field(env_cfg.scene, include_goal_assets=args_cli.play_goalpost_usd)
 
     env_cfg.viewer.origin_type = None
     env_cfg.viewer.asset_name = None

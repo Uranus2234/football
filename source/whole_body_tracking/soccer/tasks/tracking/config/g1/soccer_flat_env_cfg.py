@@ -139,8 +139,14 @@ def _soccer_lab_goal_asset_cfg(goal_asset) -> AssetBaseCfg:
     )
 
 
-def _install_soccer_lab_field(scene_cfg) -> None:
-    require_soccer_lab_assets()
+def install_soccer_lab_field(scene_cfg, include_goal_assets: bool = False) -> None:
+    """Install lightweight soccer field visuals on demand.
+
+    Training keeps this disabled so thousands of envs do not instantiate field
+    lines and referenced goal USDs. Play can enable the lightweight field; the
+    raw Soccer_Lab goalpost USD remains opt-in because it contains material
+    bindings that reference paths outside the goal asset reference scope.
+    """
     # TrackingEnvCfg expects a terrain object for the global physics material.
     # Keep the plane as the physical ground, but style it as Soccer_Lab grass
     # and add Soccer_Lab's pitch markings/goals as per-env assets.
@@ -159,8 +165,10 @@ def _install_soccer_lab_field(scene_cfg) -> None:
         setattr(scene_cfg, f"field_line_{line.name}", _soccer_lab_field_line_cfg(line))
     for post in build_goal_post_specs(SOCCER_LAB_FIELD):
         setattr(scene_cfg, f"goal_post_{post.name}", _soccer_lab_goal_post_cfg(post))
-    for goal_asset in build_goal_asset_specs(SOCCER_LAB_FIELD, z_offset=SOCCER_LAB_FIELD.goal_height * 0.5):
-        setattr(scene_cfg, goal_asset.name, _soccer_lab_goal_asset_cfg(goal_asset))
+    if include_goal_assets:
+        require_soccer_lab_assets()
+        for goal_asset in build_goal_asset_specs(SOCCER_LAB_FIELD, z_offset=SOCCER_LAB_FIELD.goal_height * 0.5):
+            setattr(scene_cfg, goal_asset.name, _soccer_lab_goal_asset_cfg(goal_asset))
 
 
 def _apply_soccer_obs(cfg):
@@ -259,7 +267,8 @@ def _make_beyondmimic_student_policy_obs(teacher_obs):
 class G1FlatSoccerSceneCfg(MySceneCfg):
     def __post_init__(self):
         super().__post_init__()
-        _install_soccer_lab_field(self)
+        # Keep training scenes lightweight. Play scripts add the soccer field
+        # explicitly so 4096-env training does not replicate field/goal assets.
 
     soccer_ball = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/SoccerBall",

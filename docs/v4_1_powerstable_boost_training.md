@@ -11,6 +11,8 @@ keeping the deploy student interface unchanged:
 - action dimension: 29
 - motion set: `motions/soccer-standard`
 - recommended start checkpoint: `checkpoints/v4_1_sidefoot_stable_model_25000.pt`
+- training scene: robot, ball, target/markers, and the ground plane only
+- play scene: lightweight Soccer_Lab field visuals are added by `play.py`
 
 The 25k checkpoint is intentionally used instead of 30k+ because 30k is already
 close to the converged slow-kick policy. At 25k the policy still has usable
@@ -53,7 +55,8 @@ bash shell/train_v4_1_powerstable_boost_ft25000.sh
 ## Playback
 
 After checkpoints are saved, play the latest checkpoint with a close follow
-camera:
+camera. Play adds field lines and lightweight cuboid goal posts by default; it
+does not load the original `goalpost.usd` unless `--play_goalpost_usd` is set.
 
 ```bash
 python scripts/rsl_rl/play.py \
